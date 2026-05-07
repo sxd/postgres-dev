@@ -5,6 +5,26 @@
 
 -- ===================================================================
 -- Late materialization: ORDER BY ... LIMIT with column projection
+-- ===================================================================
+CREATE TABLE cs_late_mat (id int, sort_key int, payload text) USING columnstore;
+INSERT INTO cs_late_mat SELECT i, 1000 - i, repeat('x', 100) || i
+    FROM generate_series(1, 2000) i;
+VACUUM cs_late_mat;
+
+-- Top-N query should benefit from late materialization
+-- (only materializes LIMIT rows, not all 2000)
+SELECT id, sort_key, length(payload) AS plen
+    FROM cs_late_mat ORDER BY sort_key LIMIT 5;
+
+-- Descending
+SELECT id, sort_key
+    FROM cs_late_mat ORDER BY sort_key DESC LIMIT 5;
+
+-- With filter
+SELECT id, sort_key
+    FROM cs_late_mat WHERE id > 1000 ORDER BY sort_key LIMIT 3;
+
+DROP TABLE cs_late_mat;
 
 -- ===================================================================
 -- TOAST: large text values through freeze and compaction

@@ -56,13 +56,11 @@ SELECT v FROM cs_planner_cost WHERE id = 100;
 -- Broad filter: Seq Scan wins.
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM cs_planner_cost WHERE id > 0;
-                       QUERY PLAN                       
---------------------------------------------------------
- Aggregate
-   ->  Custom Scan (ColumnstoreScan) on cs_planner_cost
-         Filter: (id > 0)
-         Columnstore Projected Columns: id
-(4 rows)
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Custom Scan (ColumnstoreAggregate) on cs_planner_cost
+   Columnstore Aggregates: count(att=0)
+(2 rows)
 
 DROP TABLE cs_planner_cost;
 -- ===================================================================
@@ -81,10 +79,10 @@ SET parallel_tuple_cost = 0;
 SET parallel_setup_cost = 0;
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM cs_planner_par;
-                      QUERY PLAN                       
--------------------------------------------------------
- Aggregate
-   ->  Custom Scan (ColumnstoreScan) on cs_planner_par
+                      QUERY PLAN                      
+------------------------------------------------------
+ Custom Scan (ColumnstoreAggregate) on cs_planner_par
+   Columnstore Aggregates: count(att=0)
 (2 rows)
 
 RESET max_parallel_workers_per_gather;

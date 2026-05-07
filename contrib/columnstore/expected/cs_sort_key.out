@@ -181,14 +181,13 @@ EXPLAIN (COSTS OFF) EXECUTE cs_sk_q;
 INSERT INTO cs_sk_delta VALUES (0, 'sk-0');
 -- fresh plan: Sort is back
 EXPLAIN (COSTS OFF) SELECT a FROM cs_sk_delta ORDER BY a LIMIT 5;
-                        QUERY PLAN                        
-----------------------------------------------------------
+                      QUERY PLAN                       
+-------------------------------------------------------
  Limit
-   ->  Sort
-         Sort Key: a
-         ->  Custom Scan (ColumnstoreScan) on cs_sk_delta
-               Columnstore Projected Columns: a
-(5 rows)
+   ->  Custom Scan (ColumnstoreLateMat) on cs_sk_delta
+         Columnstore LateMat Sort Keys: att=1
+         Columnstore LateMat Limit: 5
+(4 rows)
 
 SELECT a FROM cs_sk_delta ORDER BY a LIMIT 5;
  a 
@@ -202,14 +201,13 @@ SELECT a FROM cs_sk_delta ORDER BY a LIMIT 5;
 
 -- cached plan: replanned, Sort is back, output ordered
 EXPLAIN (COSTS OFF) EXECUTE cs_sk_q;
-                        QUERY PLAN                        
-----------------------------------------------------------
+                      QUERY PLAN                       
+-------------------------------------------------------
  Limit
-   ->  Sort
-         Sort Key: a
-         ->  Custom Scan (ColumnstoreScan) on cs_sk_delta
-               Columnstore Projected Columns: a
-(5 rows)
+   ->  Custom Scan (ColumnstoreLateMat) on cs_sk_delta
+         Columnstore LateMat Sort Keys: att=1
+         Columnstore LateMat Limit: 5
+(4 rows)
 
 EXECUTE cs_sk_q;
  a 

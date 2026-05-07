@@ -5,6 +5,47 @@
 -- ===================================================================
 -- Late materialization: ORDER BY ... LIMIT with column projection
 -- ===================================================================
+CREATE TABLE cs_late_mat (id int, sort_key int, payload text) USING columnstore;
+INSERT INTO cs_late_mat SELECT i, 1000 - i, repeat('x', 100) || i
+    FROM generate_series(1, 2000) i;
+VACUUM cs_late_mat;
+-- Top-N query should benefit from late materialization
+-- (only materializes LIMIT rows, not all 2000)
+SELECT id, sort_key, length(payload) AS plen
+    FROM cs_late_mat ORDER BY sort_key LIMIT 5;
+  id  | sort_key | plen 
+------+----------+------
+ 2000 |    -1000 |  104
+ 1999 |     -999 |  104
+ 1998 |     -998 |  104
+ 1997 |     -997 |  104
+ 1996 |     -996 |  104
+(5 rows)
+
+-- Descending
+SELECT id, sort_key
+    FROM cs_late_mat ORDER BY sort_key DESC LIMIT 5;
+ id | sort_key 
+----+----------
+  1 |      999
+  2 |      998
+  3 |      997
+  4 |      996
+  5 |      995
+(5 rows)
+
+-- With filter
+SELECT id, sort_key
+    FROM cs_late_mat WHERE id > 1000 ORDER BY sort_key LIMIT 3;
+  id  | sort_key 
+------+----------
+ 2000 |    -1000
+ 1999 |     -999
+ 1998 |     -998
+(3 rows)
+
+DROP TABLE cs_late_mat;
+-- ===================================================================
 -- TOAST: large text values through freeze and compaction
 -- ===================================================================
 CREATE TABLE cs_toast_stress (id int, big_text text, small_val int) USING columnstore;
@@ -96,14 +137,11 @@ SET min_parallel_table_scan_size = 0;
 SET max_parallel_workers_per_gather = 2;
 -- Verify parallel plan
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cs_parallel;
-                               QUERY PLAN                                
--------------------------------------------------------------------------
- Finalize Aggregate
-   ->  Gather
-         Workers Planned: 2
-         ->  Partial Aggregate
-               ->  Parallel Custom Scan (ColumnstoreScan) on cs_parallel
-(5 rows)
+                    QUERY PLAN                     
+---------------------------------------------------
+ Custom Scan (ColumnstoreAggregate) on cs_parallel
+   Columnstore Aggregates: count(att=0)
+(2 rows)
 
 -- Compare results
 SELECT count(*) AS par_count FROM cs_parallel;
@@ -568,14 +606,11 @@ SET min_parallel_table_scan_size = 0;
 SET max_parallel_workers_per_gather = 2;
 -- parallel aggregate pushdown must count the delta rows
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cs_par_snap;
-                               QUERY PLAN                                
--------------------------------------------------------------------------
- Finalize Aggregate
-   ->  Gather
-         Workers Planned: 2
-         ->  Partial Aggregate
-               ->  Parallel Custom Scan (ColumnstoreScan) on cs_par_snap
-(5 rows)
+                    QUERY PLAN                     
+---------------------------------------------------
+ Custom Scan (ColumnstoreAggregate) on cs_par_snap
+   Columnstore Aggregates: count(att=0)
+(2 rows)
 
 SELECT count(*) FROM cs_par_snap;
  count 

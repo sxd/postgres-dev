@@ -393,6 +393,10 @@ CONTEXT
 COP
 CRITICAL_SECTION
 CRSSnapshotAction
+CSAggGroupState
+CSAggKind
+CSAggOne
+CSAggState
 CSColumnCache
 CSColumnChunkDesc
 CSCustomScanState
@@ -401,6 +405,8 @@ CSDeltaTupleClass
 CSDictColumn
 CSFreeRange
 CSIndexFetchData
+CSLatemat
+CSLatematState
 CSMetaPageData
 CSParallelScanDesc
 CSParallelScanDescData

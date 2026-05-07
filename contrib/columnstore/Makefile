@@ -26,6 +26,7 @@ REGRESS = columnstore \
 	cs_scan_paths \
 	cs_compaction \
 	cs_pushdown \
+	cs_agg_pushdown \
 	cs_index \
 	cs_misc \
 	cs_sort_key \

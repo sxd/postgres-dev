@@ -843,14 +843,11 @@ SET min_parallel_table_scan_size = 0;
 SET max_parallel_workers_per_gather = 2;
 -- Verify EXPLAIN shows Gather node with parallel workers
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cs_basic;
-                              QUERY PLAN                              
-----------------------------------------------------------------------
- Finalize Aggregate
-   ->  Gather
-         Workers Planned: 2
-         ->  Partial Aggregate
-               ->  Parallel Custom Scan (ColumnstoreScan) on cs_basic
-(5 rows)
+                   QUERY PLAN                   
+------------------------------------------------
+ Custom Scan (ColumnstoreAggregate) on cs_basic
+   Columnstore Aggregates: count(att=0)
+(2 rows)
 
 -- Verify correctness of parallel COUNT(*)
 SELECT count(*) AS par_count FROM cs_basic;
@@ -939,14 +936,13 @@ INSERT INTO cs_sk_overlap SELECT i, 'sk-' || i FROM generate_series(1, 30) i;
 VACUUM cs_sk_overlap;
 -- Plan must have an upper Sort node.
 EXPLAIN (COSTS OFF) SELECT a FROM cs_sk_overlap ORDER BY a LIMIT 5;
-                         QUERY PLAN                         
-------------------------------------------------------------
+                       QUERY PLAN                        
+---------------------------------------------------------
  Limit
-   ->  Sort
-         Sort Key: a
-         ->  Custom Scan (ColumnstoreScan) on cs_sk_overlap
-               Columnstore Projected Columns: a
-(5 rows)
+   ->  Custom Scan (ColumnstoreLateMat) on cs_sk_overlap
+         Columnstore LateMat Sort Keys: att=1
+         Columnstore LateMat Limit: 5
+(4 rows)
 
 SELECT a FROM cs_sk_overlap ORDER BY a LIMIT 5;
  a 

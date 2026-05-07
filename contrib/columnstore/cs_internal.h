@@ -25,7 +25,6 @@
 #include "storage/bufpage.h"
 #include "utils/rel.h"
 
-
 /*
  * Alignment-safe equivalents of fetch_att()/store_att_byval() for the
  * byte-packed columnar format.
@@ -139,6 +138,18 @@ cs_write_u16(void *p, uint16 v)
 {
 	memcpy(p, &v, sizeof(v));
 }
+
+/*
+ * The SUM/AVG aggregate accumulators use native 128-bit integers, so the
+ * extension is only supported where the platform provides one.  The build
+ * system already skips columnstore where PG_INT128_TYPE is unset (32-bit
+ * builds, and MSVC, which has no __int128); this is a backstop for a forced
+ * build (e.g. PGXS) on such a platform, turning the otherwise cryptic
+ * "unknown type name 'int128'" errors into a clear message.
+ */
+#ifndef HAVE_INT128
+#error "columnstore requires native 128-bit integer support (a 64-bit, non-MSVC build); it is unsupported on this platform"
+#endif
 
 /*
  * Per-relation options for columnstore tables.
@@ -793,6 +804,7 @@ typedef struct CSIndexFetchData
 	int			tombstone_count;
 	bool		tombstones_collected;	/* lazy init flag */
 } CSIndexFetchData;
+
 
 /*
  * Custom TupleTableSlot for columnstore with lazy column decompression.

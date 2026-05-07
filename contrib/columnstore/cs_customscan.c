@@ -59,13 +59,19 @@
 #include "lib/stringinfo.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
+#include "parser/parse_oper.h"
 #include "storage/shm_toc.h"
+#include "utils/datum.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -88,9 +94,18 @@ static Bitmapset *cs_extract_scan_needed_cols(Plan *root_plan,
 											  Scan *scan_plan);
 static int	cs_extract_scan_qual_keys(List *quals, Index scanrelid,
 									  ScanKeyData **keys_out);
+static void cs_am_oid_invalidate(Datum arg, int cacheid, uint32 hashvalue);
+static Oid	cs_get_am_oid(void);
 static bool rel_is_columnstore(Oid relid);
+static bool cs_upper_input_is_columnstore_rel(PlannerInfo *root,
+											  RelOptInfo *input_rel,
+											  RangeTblEntry **rte_out);
+static List *cs_try_build_sort_pathkeys(PlannerInfo *root, RelOptInfo *rel,
+										RangeTblEntry *rte);
 static void cs_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel,
 									 Index rti, RangeTblEntry *rte);
+static void cs_open_scan(CSCustomScanState *state, EState *estate,
+						 ParallelTableScanDesc pscan);
 static Plan *cs_path_to_plan(PlannerInfo *root, RelOptInfo *rel,
 							 struct CustomPath *best_path, List *tlist,
 							 List *clauses, List *custom_plans);
@@ -119,8 +134,9 @@ static bool cs_custom_scan_recheck(CustomScanState *node,
 								   TupleTableSlot *slot);
 static void cs_apply_pushed_bloom_filters(CSCustomScanState *state);
 
-/* Saved upstream hook chain pointer */
+/* Saved upstream hook chain pointers */
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
+static create_upper_paths_hook_type prev_create_upper_paths_hook = NULL;
 
 static const struct CustomPathMethods cs_path_methods = {
 	.CustomName = "ColumnstoreScan",
@@ -144,6 +160,84 @@ static const struct CustomExecMethods cs_exec_methods = {
 	.InitializeWorkerCustomScan = cs_initialize_worker_custom_scan,
 	.ShutdownCustomScan = cs_shutdown_custom_scan,
 	.ExplainCustomScan = cs_explain_custom_scan,
+};
+
+/* Forward decls for the aggregate-pushdown CustomScan ("ColumnstoreAggregate"). */
+static Plan *cs_agg_path_to_plan(PlannerInfo *root, RelOptInfo *rel,
+								 struct CustomPath *best_path, List *tlist,
+								 List *clauses, List *custom_plans);
+static bool cs_contains_param_walker(Node *node, void *context);
+static bool cs_contains_param(Node *node);
+static Node *cs_agg_create_state(CustomScan *cscan);
+static void cs_agg_begin(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot *cs_agg_exec(CustomScanState *node);
+static void cs_agg_end(CustomScanState *node);
+static void cs_agg_rescan(CustomScanState *node);
+static void cs_agg_explain(CustomScanState *node, List *ancestors,
+						   ExplainState *es);
+static void cs_create_upper_paths_hook(PlannerInfo *root,
+									   UpperRelationKind stage,
+									   RelOptInfo *input_rel,
+									   RelOptInfo *output_rel,
+									   void *extra);
+
+/* Forward decls for the late-mat CustomScan ("ColumnstoreLateMat"). */
+static Plan *cs_lm_path_to_plan(PlannerInfo *root, RelOptInfo *rel,
+								struct CustomPath *best_path, List *tlist,
+								List *clauses, List *custom_plans);
+static Node *cs_lm_create_state(CustomScan *cscan);
+static void cs_lm_begin(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot *cs_lm_exec(CustomScanState *node);
+static void cs_lm_end(CustomScanState *node);
+static void cs_lm_rescan(CustomScanState *node);
+static void cs_lm_explain(CustomScanState *node, List *ancestors,
+						  ExplainState *es);
+static void cs_try_add_latemat_path(PlannerInfo *root, RelOptInfo *input_rel,
+									RelOptInfo *output_rel);
+
+
+/*
+ * Aggregate-pushdown internal forward decls live just above the agg
+ * implementation block (after the CSAggOne typedef) so they can reference
+ * the types those callees use.  See the CSAggOne forward decls below.
+ */
+
+static const struct CustomPathMethods cs_agg_path_methods = {
+	.CustomName = "ColumnstoreAggregate",
+	.PlanCustomPath = cs_agg_path_to_plan,
+};
+
+static const struct CustomScanMethods cs_agg_scan_methods = {
+	.CustomName = "ColumnstoreAggregate",
+	.CreateCustomScanState = cs_agg_create_state,
+};
+
+static const struct CustomExecMethods cs_agg_exec_methods = {
+	.CustomName = "ColumnstoreAggregate",
+	.BeginCustomScan = cs_agg_begin,
+	.ExecCustomScan = cs_agg_exec,
+	.EndCustomScan = cs_agg_end,
+	.ReScanCustomScan = cs_agg_rescan,
+	.ExplainCustomScan = cs_agg_explain,
+};
+
+static const struct CustomPathMethods cs_lm_path_methods = {
+	.CustomName = "ColumnstoreLateMat",
+	.PlanCustomPath = cs_lm_path_to_plan,
+};
+
+static const struct CustomScanMethods cs_lm_scan_methods = {
+	.CustomName = "ColumnstoreLateMat",
+	.CreateCustomScanState = cs_lm_create_state,
+};
+
+static const struct CustomExecMethods cs_lm_exec_methods = {
+	.CustomName = "ColumnstoreLateMat",
+	.BeginCustomScan = cs_lm_begin,
+	.ExecCustomScan = cs_lm_exec,
+	.EndCustomScan = cs_lm_end,
+	.ReScanCustomScan = cs_lm_rescan,
+	.ExplainCustomScan = cs_lm_explain,
 };
 
 /*
@@ -170,9 +264,14 @@ cs_register_custom_scan_methods(void)
 		return;
 
 	RegisterCustomScanMethods(&cs_scan_methods);
+	RegisterCustomScanMethods(&cs_agg_scan_methods);
+	RegisterCustomScanMethods(&cs_lm_scan_methods);
 
 	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = cs_set_rel_pathlist_hook;
+
+	prev_create_upper_paths_hook = create_upper_paths_hook;
+	create_upper_paths_hook = cs_create_upper_paths_hook;
 
 	registered = true;
 }
@@ -249,6 +348,38 @@ rel_is_columnstore(Oid relid)
 			  RELKIND_HAS_STORAGE(pg_class->relkind));
 	ReleaseSysCache(tuple);
 	return result;
+}
+
+/*
+ * Common gate for the upper-path hooks (aggregate and ORDER BY/LIMIT
+ * pushdown): the input must be a single plain columnstore base relation.
+ *
+ * An inheritance or partitioned parent is a base rel too, but its rows
+ * live in the append children; pushing the upper step onto just the
+ * parent would silently drop them.  Sampled scans must keep the stock
+ * TABLESAMPLE machinery.  On success, *rte_out is set to the relation's
+ * RTE.
+ */
+static bool
+cs_upper_input_is_columnstore_rel(PlannerInfo *root, RelOptInfo *input_rel,
+								  RangeTblEntry **rte_out)
+{
+	RangeTblEntry *rte;
+
+	if (input_rel->reloptkind != RELOPT_BASEREL)
+		return false;
+	rte = root->simple_rte_array[input_rel->relid];
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return false;
+	if (rte->inh)
+		return false;
+	if (rte->tablesample != NULL)
+		return false;
+	if (!rel_is_columnstore(rte->relid))
+		return false;
+
+	*rte_out = rte;
+	return true;
 }
 
 /*
@@ -1439,6 +1570,30 @@ convert_attrs:
  * ----------------------------------------------------------------
  */
 
+
+/*
+ * Does the expression reference any Param?  Quals captured for the
+ * pushdown CustomScans are compiled and evaluated in a private executor
+ * state with no access to the outer plan's parameter values, so
+ * parameterized clauses (correlated references, nestloop params) must
+ * stay with the standard plan.
+ */
+static bool
+cs_contains_param_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+		return true;
+	return expression_tree_walker(node, cs_contains_param_walker, context);
+}
+
+static bool
+cs_contains_param(Node *node)
+{
+	return cs_contains_param_walker(node, NULL);
+}
+
 /*
  * extract_scan_qual_keys
  *		Extract btree-strategy scan keys from a list of qual expressions.
@@ -1696,4 +1851,2478 @@ cs_extract_scan_qual_keys(List *quals, Index scanrelid, ScanKeyData **keys_out)
 
 	*keys_out = keys;
 	return nkeys;
+}
+
+/* ========================================================================
+ * Aggregate pushdown via create_upper_paths_hook (the
+ * "ColumnstoreAggregate" CustomScan).
+ *
+ * Replaces an Aggregate node sitting directly above a columnstore base
+ * relation when every aggregate in the targetlist is recognised by
+ * cs_aggref_pushdown_kind.  The recognised set is:
+ *
+ *   COUNT(*), COUNT(col), COUNT(DISTINCT col)
+ *      -> int8 row counter; DISTINCT uses a TupleHashTable dedup pass
+ *
+ *   SUM(int2|int4)             -> int128 accumulator, returns int8
+ *   SUM(int8)                  -> int128 accumulator, returns numeric
+ *   SUM(numeric)               -> int128 accumulator on NI64-encoded
+ *                                 columns, fallback to numeric_add
+ *   AVG(int2|int4|int8)        -> int128 sum + int8 count
+ *   AVG(numeric)               -> numeric sum + int8 count
+ *
+ *   MIN/MAX over any type with a btree cmp_proc
+ *      (enumerated explicitly for int2/int4/int8/float4/float8/date/
+ *      time/timetz/timestamp/timestamptz/text/numeric/bpchar/interval/
+ *      bytea, plus user-defined MIN/MAX following the same shape)
+ *      -> Datum compare via the typcache cmp_proc with first-row
+ *      tracking.
+ *
+ * Two stages dispatch into this code:
+ *   - UPPERREL_GROUP_AGG (ungrouped queries): a sequential
+ *     ColumnstoreAggregate that emits one row of finalised values.
+ *   - UPPERREL_PARTIAL_GROUP_AGG (grouped queries): a parallel-aware
+ *     partial path; each worker accumulates its own grouphash and
+ *     emits per-group transition state for the upstream Finalize
+ *     Aggregate to combine.  See the partial-path block further down
+ *     in cs_create_upper_paths_hook.
+ *
+ * The CustomScan's executor opens a TableScanDesc, runs through every
+ * row, accumulating per-aggregate state; on the second EXEC call it
+ * emits a single tuple (or one tuple per group) containing the
+ * finalized aggregate values, and returns NULL on the next call (EOF).
+ *
+ * The path is added to output_rel (the post-aggregate upper rel), not
+ * input_rel.  Standard Aggregate paths are already on output_rel; we
+ * add ours alongside, costed cheaper so the planner picks it.
+ * ========================================================================
+ */
+
+#include "access/htup_details.h"
+#include "catalog/pg_aggregate.h"
+#include "fmgr.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/numeric.h"
+#include "utils/typcache.h"
+
+/* Per-aggregate runtime state. */
+typedef enum CSAggKind
+{
+	CS_AGG_COUNT,				/* COUNT(*) or COUNT(col): int8 counter */
+	CS_AGG_COUNT_DISTINCT,		/* COUNT(DISTINCT col): hash-set dedup */
+	CS_AGG_SUM_NUMERIC,			/* SUM(numeric): int128 (NI64) or numeric_add */
+	CS_AGG_AVG_NUMERIC,			/* AVG(numeric): SUM via numeric_add + count */
+	CS_AGG_SUM_INT,				/* SUM(int2|int4): int8 result via int128 acc */
+	CS_AGG_SUM_INT8,			/* SUM(int8): numeric result via int128 acc */
+	CS_AGG_AVG_INT,				/* AVG(int2|int4|int8): numeric via int128 +
+								 * count */
+	CS_AGG_MIN,					/* MIN via type's btree cmp_proc */
+	CS_AGG_MAX,					/* MAX via type's btree cmp_proc */
+	CS_AGG_GROUP_KEY,			/* not an aggregate: a group-by column */
+	CS_AGG_PASSTHROUGH,			/* constant in target list */
+} CSAggKind;
+
+typedef struct CSAggOne
+{
+	CSAggKind	kind;
+	AttrNumber	col_attno;		/* 1-based, 0 for COUNT(*); for GROUP_KEY: the
+								 * input rel attno being grouped on */
+	bool		count_skips_null;
+	int64		count;
+	int128		sumX;			/* int128 accumulator for NI64 fast path */
+	int32		dscale;			/* dscale of the NUMERIC column */
+	bool		ni64_active;	/* sumX has accumulated >= 1 NI64 raw value */
+	bool		saw_value;		/* any non-null row contributed to the
+								 * aggregate via either the int128 or the
+								 * numeric_add fallback path */
+	Numeric		num_acc;		/* fallback Numeric accumulator */
+	bool		num_acc_valid;
+	Datum		minmax;
+	bool		minmax_isnull;
+	bool		first_row;
+	Oid			col_type;
+	int16		col_typlen;		/* MIN/MAX: typlen for datumCopy/pfree */
+	bool		col_typbyval;	/* MIN/MAX: typbyval */
+	Oid			col_collation;	/* MIN/MAX: collation for cmp_proc */
+	FmgrInfo   *cmp_finfo;		/* MIN/MAX: btree cmp_proc fmgrinfo (or NULL) */
+	Expr	   *filter_clause;	/* FILTER (WHERE ...) raw expr or NULL */
+	ExprState  *filter_state;	/* compiled filter, built in cs_agg_begin */
+
+	/*
+	 * COUNT(DISTINCT col) state.  The first three fields (the desc/slot/
+	 * eq+hash funcs) are template metadata, set up once in cs_agg_begin and
+	 * copied to each per-group CSAggOne by reference -- they're read-only at
+	 * run time so sharing is safe.  distinct_hash itself is per-group:
+	 * state->aggs[i] owns the ungrouped table; gstate->aggs[i] owns its
+	 * group's table, built lazily on isnew.
+	 */
+	TupleDesc	distinct_desc;
+	TupleTableSlot *distinct_slot;
+	Oid		   *distinct_eqfn;
+	FmgrInfo   *distinct_hashfn;
+	Oid		   *distinct_coll;
+	TupleHashTable distinct_hash;
+} CSAggOne;
+
+/*
+ * Per-group payload stored in the hash table's per-entry additional area.
+ * Reset for each new group; cs_agg_exec walks state->aggs as the
+ * "template" and uses these per-group copies for per-row accumulation.
+ */
+typedef struct CSAggGroupState
+{
+	CSAggOne   *aggs;			/* nagg entries, indexed by output position */
+} CSAggGroupState;
+
+typedef struct CSAggState
+{
+	CustomScanState css;		/* must be first */
+	TableScanDesc scandesc;
+	int			nagg;			/* output positions (group keys + aggs +
+								 * consts) */
+	CSAggOne   *aggs;			/* template per output position */
+	bool		emitted;
+	bool		exhausted;
+	TupleTableSlot *probe_slot; /* slot used to read input rows */
+	ExprState  *qual_state;		/* per-row residual filter, or NULL */
+
+	/* GROUP BY support */
+	int			ngrpkeys;		/* number of group-key output positions */
+	int		   *grpkey_outpos;	/* output position for each group key */
+	AttrNumber *grpkey_attnos;	/* input rel attno for each group key */
+	TupleHashTable grouphash;	/* group hash table; NULL for ungrouped */
+	TupleTableSlot *grp_slot;	/* slot for hash key lookup, sized to grp keys */
+	TupleHashIterator grp_iter;
+	bool		grp_iter_started;
+
+	/*
+	 * Contexts backing all of this node's tuple hash tables (grouphash and
+	 * the COUNT(DISTINCT) sets).  Created lazily by
+	 * cs_agg_ensure_hash_cxts(); NULL until then.  hash_tuplescxt holds the
+	 * hashed tuples and per-entry payloads and lives until shutdown;
+	 * hash_tempcxt is per-lookup scratch, reset once per input row.
+	 */
+	MemoryContext hash_tuplescxt;
+	MemoryContext hash_tempcxt;
+} CSAggState;
+
+/*
+ * Magnitude bound for the NI64 int128 fast-path accumulator.  int128
+ * holds ~1.7e38 (~2^127); values and sums are kept at or below 2^122 so
+ * that one more multiply-by-ten (~2^125.4) plus one addition still fits
+ * comfortably.  Crossing the bound folds the running sum into the
+ * unbounded-precision Numeric accumulator (cs_agg_ni64_flush).
+ */
+#define CS_NI64_RESCALE_LIMIT	(((int128) 1) << 122)
+
+/* Forward decls for aggregate-pushdown internals. */
+static Numeric cs_int128_to_numeric(int128 val, int dscale);
+static void cs_agg_num_acc_add(CSAggOne *a, Numeric n);
+static void cs_agg_ni64_flush(CSAggOne *a);
+static void cs_agg_ensure_hash_cxts(CSAggState *state, EState *estate);
+static bool cs_aggref_pushdown_kind(Aggref *agg, Relation rel, CSAggOne *out);
+static void cs_agg_accum_row(CSAggOne *a, TableScanDesc scandesc,
+							 TupleTableSlot *slot, ExprContext *econtext);
+static void cs_agg_emit_one(CSAggOne *a, TupleTableSlot *out, int outpos);
+
+/*
+ * Convert a (possibly negative) int128 numerator with the given decimal
+ * scale to a Numeric.  Used to finalize SUM(numeric)/AVG(numeric) when
+ * the column was read via the NI64 fast path.
+ *
+ * Implementation builds a decimal text representation and feeds it to
+ * numeric_in.  This runs once per group at finalize time, so the
+ * conversion overhead is amortized over millions of accumulated rows.
+ */
+static Numeric
+cs_int128_to_numeric(int128 val, int dscale)
+{
+	char		digits[40];		/* int128 magnitude: at most 39 decimal digits */
+	int			ndigits = 0;
+	bool		neg = (val < 0);
+	uint128		uval = neg ? (uint128) (-val) : (uint128) val;
+	int			intlen;
+	char	   *out;
+	char	   *p;
+	Numeric		result;
+
+	/* Decimal digits of the magnitude, least-significant first. */
+	if (uval == 0)
+		digits[ndigits++] = '0';
+	else
+	{
+		while (uval > 0)
+		{
+			digits[ndigits++] = (char) ('0' + (int) (uval % 10));
+			uval /= 10;
+		}
+	}
+
+	/*
+	 * Build "[-]<int>.<frac>", where the low dscale digits are the fraction.
+	 * The integer part has max(ndigits - dscale, 1) digits; the fraction has
+	 * exactly dscale digits, with leading zeros when dscale >= ndigits.
+	 *
+	 * dscale is the column's stored scale and can be as large as a numeric
+	 * permits (up to NUMERIC_DSCALE_MASK = 16383), so the text does not fit a
+	 * fixed stack buffer: size it to dscale.  digits[] itself is never
+	 * indexed past the int128 width.  This runs once per group at finalize,
+	 * so the allocation is negligible.
+	 */
+	intlen = (ndigits > dscale) ? (ndigits - dscale) : 1;
+	out = palloc((Size) 1 /* sign */ + intlen + 1 /* dot */ + dscale + 1);
+	p = out;
+
+	if (neg)
+		*p++ = '-';
+
+	/* Integer part. */
+	if (ndigits > dscale)
+	{
+		for (int i = ndigits - 1; i >= dscale; i--)
+			*p++ = digits[i];
+	}
+	else
+		*p++ = '0';
+
+	/* Fraction: low dscale digits, zero-filled above the value's width. */
+	if (dscale > 0)
+	{
+		*p++ = '.';
+		for (int i = dscale - 1; i >= 0; i--)
+			*p++ = (i < ndigits) ? digits[i] : '0';
+	}
+	*p = '\0';
+
+	result = DatumGetNumeric(DirectFunctionCall3(numeric_in,
+												 CStringGetDatum(out),
+												 ObjectIdGetDatum(InvalidOid),
+												 Int32GetDatum(-1)));
+	pfree(out);
+	return result;
+}
+
+/*
+ * Fold the NI64 int128 accumulator into the Numeric accumulator and zero
+ * it.  Used when rescaling to a higher dscale would risk overflowing
+ * int128: the running sum moves to unbounded-precision Numeric (the same
+ * accumulator the non-NI64 fallback path uses; the emit path already
+ * merges both), and int128 accumulation restarts from zero.
+ */
+/*
+ * Add a freshly allocated Numeric into the aggregate's Numeric
+ * accumulator, taking ownership of (and ultimately freeing) 'n'.
+ * Superseded intermediates are freed eagerly: they would otherwise pile
+ * up once per row for the whole scan.
+ */
+static void
+cs_agg_num_acc_add(CSAggOne *a, Numeric n)
+{
+	Datum		add;
+	Numeric		prev;
+
+	if (!a->num_acc_valid)
+	{
+		a->num_acc = n;
+		a->num_acc_valid = true;
+		return;
+	}
+
+	add = DirectFunctionCall2(numeric_add,
+							  NumericGetDatum(a->num_acc),
+							  NumericGetDatum(n));
+	prev = a->num_acc;
+	/* numeric_add returns a fresh palloc'd result; adopt it directly */
+	a->num_acc = DatumGetNumeric(add);
+	pfree(prev);
+	pfree(n);
+}
+
+static void
+cs_agg_ni64_flush(CSAggOne *a)
+{
+	cs_agg_num_acc_add(a, cs_int128_to_numeric(a->sumX, a->dscale));
+	a->sumX = 0;
+}
+
+/*
+ * Decide whether an Aggref can be pushed down.  If yes, fill in `out`
+ * with the kind and column attno; return true.
+ *
+ * Dispatch is by aggfnoid -- the fmgroids.h F_* constants identify both
+ * the aggregate function and its argument type unambiguously, so no
+ * runtime catalog lookup or string comparison is needed.
+ */
+static bool
+cs_aggref_pushdown_kind(Aggref *agg, Relation rel, CSAggOne *out)
+{
+	Oid			fnoid = agg->aggfnoid;
+	TargetEntry *arg;
+	Var		   *v;
+	bool		is_min = false;
+	bool		is_max = false;
+	TypeCacheEntry *tcache;
+
+	/*
+	 * No ORDER BY inside the aggregate.  FILTER and DISTINCT are allowed:
+	 * FILTER is evaluated per row before accumulating; DISTINCT is
+	 * implemented for COUNT(DISTINCT col) only via a hash-set dedup -- other
+	 * DISTINCT shapes (SUM/AVG DISTINCT) bail to the standard Agg path
+	 * further down.
+	 */
+	if (agg->aggorder != NIL)
+		return false;
+	if (agg->aggvariadic)
+		return false;
+	if (agg->agglevelsup != 0)
+		return false;
+
+	/*
+	 * Stash the FILTER clause unprocessed by setrefs, so its Vars retain
+	 * their relid-based varno and evaluate against probe_slot at runtime.
+	 */
+	out->filter_clause = (Expr *) copyObject(agg->aggfilter);
+
+	/* COUNT(*) -- aggref args is an empty list. */
+	if (list_length(agg->args) == 0 && agg->aggstar &&
+		fnoid == F_COUNT_)
+	{
+		out->kind = CS_AGG_COUNT;
+		out->col_attno = 0;
+		out->count_skips_null = false;
+		return true;
+	}
+
+	/* COUNT(col) and COUNT(DISTINCT col). */
+	if (fnoid == F_COUNT_ANY)
+	{
+		if (list_length(agg->args) != 1)
+			return false;
+		arg = linitial_node(TargetEntry, agg->args);
+		if (!IsA(arg->expr, Var))
+			return false;
+		v = (Var *) arg->expr;
+		if (v->varlevelsup != 0)
+			return false;
+		out->col_attno = v->varattno;
+		out->col_type = v->vartype;
+		if (agg->aggdistinct != NIL)
+		{
+			out->kind = CS_AGG_COUNT_DISTINCT;
+			out->col_collation = agg->inputcollid;
+			return true;
+		}
+		out->kind = CS_AGG_COUNT;
+		out->count_skips_null = true;
+		return true;
+	}
+
+	/*
+	 * SUM/AVG/MIN/MAX with DISTINCT: bail.  The hash-dedup machinery here is
+	 * for COUNT only; rare enough to leave to the standard Agg path.
+	 */
+	if (agg->aggdistinct != NIL)
+		return false;
+
+	/* All remaining cases require a single Var argument. */
+	if (list_length(agg->args) != 1)
+		return false;
+	arg = linitial_node(TargetEntry, agg->args);
+	if (!IsA(arg->expr, Var))
+		return false;
+	v = (Var *) arg->expr;
+	if (v->varlevelsup != 0)
+		return false;
+	out->col_attno = v->varattno;
+	out->col_type = v->vartype;
+
+	switch (fnoid)
+	{
+		case F_SUM_NUMERIC:
+			out->kind = CS_AGG_SUM_NUMERIC;
+			return true;
+		case F_AVG_NUMERIC:
+			out->kind = CS_AGG_AVG_NUMERIC;
+			return true;
+		case F_SUM_INT2:
+		case F_SUM_INT4:
+			out->kind = CS_AGG_SUM_INT;
+			return true;
+		case F_SUM_INT8:
+			out->kind = CS_AGG_SUM_INT8;
+			return true;
+		case F_AVG_INT2:
+		case F_AVG_INT4:
+		case F_AVG_INT8:
+			out->kind = CS_AGG_AVG_INT;
+			return true;
+		default:
+			break;
+	}
+
+	/*
+	 * MIN/MAX over any type with a btree cmp_proc.  The fmgroids.h F_MIN_* /
+	 * F_MAX_* set is enumerated, but we also accept user-defined MIN/MAX
+	 * aggregates that follow the same shape (single Var, return type = input
+	 * type, type has cmp_proc).  Runtime uses the typcache's cached FmgrInfo,
+	 * so the per-row cost is one FunctionCall2Coll.
+	 */
+	switch (fnoid)
+	{
+		case F_MIN_INT2:
+		case F_MIN_INT4:
+		case F_MIN_INT8:
+		case F_MIN_FLOAT4:
+		case F_MIN_FLOAT8:
+		case F_MIN_DATE:
+		case F_MIN_TIME:
+		case F_MIN_TIMETZ:
+		case F_MIN_TIMESTAMP:
+		case F_MIN_TIMESTAMPTZ:
+		case F_MIN_TEXT:
+		case F_MIN_NUMERIC:
+		case F_MIN_BPCHAR:
+		case F_MIN_INTERVAL:
+		case F_MIN_BYTEA:
+			is_min = true;
+			break;
+		case F_MAX_INT2:
+		case F_MAX_INT4:
+		case F_MAX_INT8:
+		case F_MAX_FLOAT4:
+		case F_MAX_FLOAT8:
+		case F_MAX_DATE:
+		case F_MAX_TIME:
+		case F_MAX_TIMETZ:
+		case F_MAX_TIMESTAMP:
+		case F_MAX_TIMESTAMPTZ:
+		case F_MAX_TEXT:
+		case F_MAX_NUMERIC:
+		case F_MAX_BPCHAR:
+		case F_MAX_INTERVAL:
+		case F_MAX_BYTEA:
+			is_max = true;
+			break;
+		default:
+			return false;
+	}
+	(void) is_max;				/* set in switch but only is_min is read */
+
+	tcache = lookup_type_cache(out->col_type, TYPECACHE_CMP_PROC_FINFO);
+	if (!OidIsValid(tcache->cmp_proc) ||
+		tcache->cmp_proc_finfo.fn_oid == InvalidOid)
+		return false;
+
+	out->kind = is_min ? CS_AGG_MIN : CS_AGG_MAX;
+	out->col_typlen = tcache->typlen;
+	out->col_typbyval = tcache->typbyval;
+	out->col_collation = agg->inputcollid;
+	out->cmp_finfo = &tcache->cmp_proc_finfo;
+	return true;
+}
+
+static void
+cs_create_upper_paths_hook(PlannerInfo *root, UpperRelationKind stage,
+						   RelOptInfo *input_rel, RelOptInfo *output_rel,
+						   void *extra)
+{
+	Query	   *parse = root->parse;
+	RangeTblEntry *rte;
+	Relation	rel;
+	List	   *agg_descs = NIL;
+	List	   *having_aggrefs_extra = NIL;
+	List	   *having_aggrefs = NIL;
+	List	   *baseclauses = NIL;
+	List	   *priv;
+	ListCell   *lc;
+	ListCell   *lc2;
+	CustomPath *cpath;
+	Path	   *cheapest;
+
+	if (prev_create_upper_paths_hook)
+		prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
+
+	if (stage == UPPERREL_ORDERED)
+	{
+		cs_try_add_latemat_path(root, input_rel, output_rel);
+		return;
+	}
+
+	if (stage != UPPERREL_GROUP_AGG)
+		return;
+
+	/* GROUPING SETS, ROLLUP, CUBE not supported. */
+	if (parse->groupingSets != NIL ||
+		parse->hasWindowFuncs || parse->hasTargetSRFs)
+		return;
+	if (!parse->hasAggs && parse->groupClause == NIL)
+		return;
+
+	/* Single plain columnstore base relation only. */
+	if (!cs_upper_input_is_columnstore_rel(root, input_rel, &rte))
+		return;
+
+	/* WHERE clauses are forwarded as scan-key pushdown + residual filter. */
+
+	rel = relation_open(rte->relid, NoLock);
+
+	/*
+	 * Each targetlist entry must be one of: * Const                 -
+	 * passthrough constant * Var on input rel      - GROUP BY column (we
+	 * accept any Var here since it must come from somewhere; the planner has
+	 * already validated GROUP BY coverage) * Aggref pushdownable   - a
+	 * recognized agg pattern
+	 */
+	foreach(lc, parse->targetList)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		CSAggOne	desc = {0};
+
+		if (IsA(tle->expr, Const))
+		{
+			agg_descs = lappend(agg_descs, NULL);
+			continue;
+		}
+		if (IsA(tle->expr, Var))
+		{
+			Var		   *v = (Var *) tle->expr;
+			CSAggOne   *copy;
+
+			if (v->varno != input_rel->relid)
+			{
+				relation_close(rel, NoLock);
+				return;
+			}
+			copy = palloc(sizeof(CSAggOne));
+			memset(copy, 0, sizeof(*copy));
+			copy->kind = CS_AGG_GROUP_KEY;
+			copy->col_attno = v->varattno;
+			copy->col_type = v->vartype;
+			agg_descs = lappend(agg_descs, copy);
+			continue;
+		}
+		if (!IsA(tle->expr, Aggref))
+		{
+			relation_close(rel, NoLock);
+			return;
+		}
+		if (!cs_aggref_pushdown_kind((Aggref *) tle->expr, rel, &desc))
+		{
+			relation_close(rel, NoLock);
+			return;
+		}
+		{
+			CSAggOne   *copy = palloc(sizeof(CSAggOne));
+
+			*copy = desc;
+			agg_descs = lappend(agg_descs, copy);
+		}
+	}
+
+	/*
+	 * HAVING may reference Aggrefs that are not in the SELECT target list
+	 * (e.g. SELECT grp FROM ... HAVING count(*) > 100).  Augment our
+	 * custom_scan_tlist with these so setrefs.c's fix_upper_expr can rewrite
+	 * them to slot positions; they are emitted by cs_agg_exec alongside the
+	 * SELECT-list aggregates and dropped by the plan-level targetlist after
+	 * HAVING evaluation.  Bail if any HAVING-only Aggref isn't pushdownable.
+	 */
+	if (parse->havingQual != NULL)
+		having_aggrefs = pull_var_clause((Node *) parse->havingQual,
+										 PVC_INCLUDE_AGGREGATES);
+	foreach(lc2, having_aggrefs)
+	{
+		Node	   *node = (Node *) lfirst(lc2);
+		Aggref	   *hagg;
+		ListCell   *lc3;
+		bool		found = false;
+		CSAggOne	desc = {0};
+		CSAggOne   *copy;
+
+		if (!IsA(node, Aggref))
+			continue;			/* group-key Var: already in tlist */
+		hagg = (Aggref *) node;
+
+		foreach(lc3, parse->targetList)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc3);
+
+			if (IsA(tle->expr, Aggref) && equal(tle->expr, hagg))
+			{
+				found = true;
+				break;
+			}
+		}
+		if (found)
+			continue;
+
+		if (!cs_aggref_pushdown_kind(hagg, rel, &desc))
+		{
+			relation_close(rel, NoLock);
+			return;
+		}
+		copy = palloc(sizeof(CSAggOne));
+		*copy = desc;
+		agg_descs = lappend(agg_descs, copy);
+		having_aggrefs_extra = lappend(having_aggrefs_extra, hagg);
+	}
+
+	relation_close(rel, NoLock);
+
+	/*
+	 * If GROUP BY is present, every key expression must be a simple Var
+	 * referencing the input rel.  We rely on the planner to put one matching
+	 * Var in the target list per group key, which is the case for ordinary
+	 * plain GROUP BY x, y, z queries.
+	 */
+	if (parse->groupClause != NIL)
+	{
+		foreach(lc2, parse->groupClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc2);
+			TargetEntry *tle = get_sortgroupclause_tle(sgc, parse->targetList);
+
+			if (!IsA(tle->expr, Var))
+				return;
+			if (((Var *) tle->expr)->varno != input_rel->relid)
+				return;
+		}
+
+		/*
+		 * GROUP BY pushdown is disabled: our TupleHashTable is in-memory and
+		 * can't spill, while the standard HashAgg (PG18+) and GroupAggregate
+		 * paths can.  The planner's estimate of output_rel->rows is
+		 * unreliable for combined keys (e.g. ClickBench Q33's
+		 * WHATCID/CLIENTID combo: planner says ~hundreds of thousands, actual
+		 * is millions -> OOM).  Defer to the memory-bounded standard paths
+		 * for any GROUP BY query; the pushdown still wins big on ungrouped
+		 * aggregates (the most common analytical shape).
+		 */
+		return;
+	}
+
+	if (agg_descs == NIL)
+		return;
+
+	/* Use the cheapest input path's row count as our scan-cost reference. */
+	cheapest = input_rel->cheapest_total_path;
+	if (cheapest == NULL)
+		return;
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = output_rel;
+	cpath->path.pathtarget = output_rel->reltarget;
+	cpath->path.parallel_aware = false;
+	cpath->path.parallel_safe = false;
+	cpath->path.parallel_workers = 0;
+	cpath->path.rows = 1;
+	cpath->path.startup_cost = cheapest->total_cost;
+	cpath->path.total_cost = cheapest->total_cost +
+		cpu_tuple_cost * cheapest->rows * 0.1;
+	cpath->path.pathkeys = NIL;
+	cpath->custom_paths = NIL;
+
+	/*
+	 * Stash for cs_agg_begin / cs_agg_path_to_plan: 1. agg_descs       --
+	 * per-Aggref descriptors 2. relid (Integer) -- input scan rti 3.
+	 * baseclauses     -- restrict clauses to apply at scan time 4. havingQual
+	 * -- HAVING clauses to apply per group at emit 5. having_extra    --
+	 * HAVING-only Aggrefs to append to scan tlist
+	 */
+	foreach(lc2, input_rel->baserestrictinfo)
+	{
+		RestrictInfo *ri = lfirst_node(RestrictInfo, lc2);
+
+		/*
+		 * SubPlans cannot be compiled by the executor-side
+		 * ExecPrepareQual(parent = NULL); leave such queries to the standard
+		 * Aggregate plan.
+		 */
+		if (contain_subplans((Node *) ri->clause) ||
+			cs_contains_param((Node *) ri->clause))
+			return;
+
+		baseclauses = lappend(baseclauses, copyObject(ri->clause));
+	}
+	priv = list_make4(agg_descs,
+					  makeInteger(input_rel->relid),
+					  baseclauses,
+					  copyObject(parse->havingQual));
+	priv = lappend(priv, having_aggrefs_extra);
+	cpath->custom_private = priv;
+	cpath->methods = &cs_agg_path_methods;
+	cpath->flags = 0;
+
+	add_path(output_rel, &cpath->path);
+}
+
+/*
+ * Plan-time conversion: build a CustomScan node carrying the agg
+ * descriptors and the underlying scan's relid in custom_private.
+ */
+static Plan *
+cs_agg_path_to_plan(PlannerInfo *root, RelOptInfo *rel,
+					struct CustomPath *best_path, List *tlist,
+					List *clauses, List *custom_plans)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+	int			scanrelid = intVal(lsecond(best_path->custom_private));
+	Node	   *having = (list_length(best_path->custom_private) > 3
+						  ? (Node *) list_nth(best_path->custom_private, 3)
+						  : NULL);
+	List	   *having_extra = (list_length(best_path->custom_private) > 4
+								? (List *) list_nth(best_path->custom_private, 4)
+								: NIL);
+	List	   *augmented_tlist = list_copy(tlist);
+	int			next_resno = list_length(tlist) + 1;
+	ListCell   *lc;
+
+	/*
+	 * Append HAVING-only Aggrefs to the scan tlist so fix_upper_expr can
+	 * rewrite plan.qual against them.  These positions show up in the scan
+	 * slot but are dropped by plan.targetlist projection.
+	 */
+	foreach(lc, having_extra)
+	{
+		Aggref	   *agg = (Aggref *) lfirst(lc);
+		TargetEntry *tle = makeTargetEntry((Expr *) agg, next_resno++,
+										   NULL, false);
+
+		augmented_tlist = lappend(augmented_tlist, tle);
+	}
+
+	/*
+	 * Both plan.targetlist and custom_scan_tlist hold the same Aggref-
+	 * bearing expressions.  setrefs.c's fix_upper_expr will replace each
+	 * Aggref in plan.targetlist with a Var(INDEX_VAR, resno) pointing into
+	 * custom_scan_tlist; the executor reads our synthesized scan tuple at
+	 * those slot positions without evaluating the Aggref itself.
+	 *
+	 * HAVING is plumbed through plan.qual the same way: setrefs's
+	 * fix_upper_expr rewrites Aggref / group-Var references against
+	 * custom_scan_tlist so that at runtime ExecQual reads slot positions
+	 * directly without touching the Aggref evaluator.  cs_agg_exec applies
+	 * ps.qual after each group's projection.
+	 */
+	cscan->scan.plan.targetlist = tlist;
+	if (having != NULL && IsA(having, List))
+		cscan->scan.plan.qual = (List *) having;
+	else if (having != NULL)
+		cscan->scan.plan.qual = list_make1(having);
+	else
+		cscan->scan.plan.qual = NIL;
+	cscan->scan.plan.lefttree = NULL;
+	cscan->scan.plan.righttree = NULL;
+	cscan->scan.plan.parallel_aware = false;
+	cscan->scan.plan.parallel_safe = false;
+	cscan->scan.scanrelid = scanrelid;
+
+	cscan->flags = best_path->flags;
+	cscan->custom_plans = NIL;
+	cscan->custom_exprs = NIL;
+
+	/*
+	 * custom_private carries: - linitial: the agg descriptors - lsecond:
+	 * base-rel restriction clauses (Vars retain their input-rel varnos;
+	 * setrefs.c does not process custom_private, so we evaluate them
+	 * ourselves at execution time with ecxt_scantuple=probe_slot).
+	 */
+	cscan->custom_private = list_make2(linitial(best_path->custom_private),
+									   lthird(best_path->custom_private));
+	cscan->custom_scan_tlist = (List *) copyObject(augmented_tlist);
+	cscan->custom_relids = bms_make_singleton(scanrelid);
+	cscan->methods = &cs_agg_scan_methods;
+
+	return (Plan *) cscan;
+}
+
+/*
+ * Create the memory contexts backing this node's tuple hash tables, once.
+ *
+ * BuildTupleHashTable() requires the tuples context to be distinct from the
+ * metadata context (resetting the former must not destroy the latter).  The
+ * temp context is scratch space for hash/equality evaluation during lookups;
+ * the accumulation loops reset it once per input row.  All hash tables of
+ * one CSAggState share both contexts.
+ */
+static void
+cs_agg_ensure_hash_cxts(CSAggState *state, EState *estate)
+{
+	if (state->hash_tuplescxt != NULL)
+		return;
+	state->hash_tuplescxt =
+		AllocSetContextCreate(estate->es_query_cxt,
+							  "ColumnstoreAgg hash tuples",
+							  ALLOCSET_DEFAULT_SIZES);
+	state->hash_tempcxt =
+		AllocSetContextCreate(estate->es_query_cxt,
+							  "ColumnstoreAgg hash temp",
+							  ALLOCSET_SMALL_SIZES);
+}
+
+static Node *
+cs_agg_create_state(CustomScan *cscan)
+{
+	CSAggState *state = palloc0(sizeof(CSAggState));
+
+	NodeSetTag(state, T_CustomScanState);
+	state->css.methods = &cs_agg_exec_methods;
+
+	/*
+	 * We synthesize a single virtual tuple per query.  ss_ScanTupleSlot's
+	 * tupledesc is built from custom_scan_tlist; using TTSOpsVirtual lets us
+	 * fill tts_values/tts_isnull directly.
+	 */
+	state->css.slotOps = &TTSOpsVirtual;
+	return (Node *) state;
+}
+
+static void
+cs_agg_begin(CustomScanState *node, EState *estate, int eflags)
+{
+	CSAggState *state = (CSAggState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	List	   *agg_descs = (List *) linitial(cscan->custom_private);
+	List	   *baseclauses = (list_length(cscan->custom_private) > 1
+							   ? (List *) lsecond(cscan->custom_private)
+							   : NIL);
+	Relation	rel = node->ss.ss_currentRelation;
+	Bitmapset  *needed_cols = NULL;
+	ScanKeyData *qual_keys = NULL;
+	int			nqual_keys = 0;
+	ListCell   *lc;
+	int			i;
+
+	Assert(rel != NULL);
+
+	state->scandesc = rel->rd_tableam->scan_begin(rel, estate->es_snapshot,
+												  0, NULL, NULL,
+												  SO_TYPE_SEQSCAN |
+												  SO_ALLOW_STRAT |
+												  SO_ALLOW_SYNC |
+												  SO_ALLOW_PAGEMODE);
+
+	state->nagg = list_length(agg_descs);
+	state->aggs = palloc0(sizeof(CSAggOne) * state->nagg);
+	i = 0;
+	foreach(lc, agg_descs)
+	{
+		CSAggOne   *src = (CSAggOne *) lfirst(lc);
+
+		if (src == NULL)		/* constant pass-through */
+		{
+			state->aggs[i].col_attno = -1;	/* sentinel */
+			i++;
+			continue;
+		}
+		state->aggs[i] = *src;
+		state->aggs[i].first_row = true;
+		if (src->col_attno > 0)
+			needed_cols = bms_add_member(needed_cols, src->col_attno - 1);
+
+		/*
+		 * Compile the FILTER (if any) into an ExprState.  Vars in the filter
+		 * reference the relation's column numbers (we copyObject'd the filter
+		 * from the parser-level Aggref before setrefs touched it), so we
+		 * evaluate against probe_slot at runtime.  We also add
+		 * filter-referenced columns to needed_cols so the AM materializes
+		 * them.  parent=NULL keeps EEOP_SCAN_FETCHSOME from chasing into our
+		 * CustomScanState's scan-output slot (which has the agg tupledesc,
+		 * not the relation tupledesc).
+		 */
+		if (src->filter_clause != NULL)
+		{
+			List	   *flist = list_make1(src->filter_clause);
+			List	   *fvars;
+			ListCell   *fc;
+
+			state->aggs[i].filter_state = ExecPrepareQual(flist, estate);
+			fvars = pull_var_clause((Node *) src->filter_clause, 0);
+			foreach(fc, fvars)
+			{
+				Var		   *v = (Var *) lfirst(fc);
+
+				if (v->varno == cscan->scan.scanrelid && v->varattno > 0)
+					needed_cols = bms_add_member(needed_cols, v->varattno - 1);
+			}
+		}
+
+		/*
+		 * COUNT(DISTINCT col) setup.  Build a 1-column TupleHashTable
+		 * descriptor + slot + eq/hash funcs once per CSAggOne; per-group hash
+		 * tables (in gstate->aggs[i].distinct_hash) reuse this metadata.  For
+		 * ungrouped queries the hash table itself lives on state->aggs[i] and
+		 * is built here too.
+		 */
+		if (state->aggs[i].kind == CS_AGG_COUNT_DISTINCT)
+		{
+			TupleDesc	d_desc;
+			Form_pg_attribute relatt = TupleDescAttr(RelationGetDescr(rel),
+													 src->col_attno - 1);
+			AttrNumber	keyColIdx[1] = {1};
+			Oid		   *eqOps = palloc(sizeof(Oid) * 1);
+			Oid		   *eqfuncoids;
+			FmgrInfo   *hashfunctions;
+			Oid		   *colls = palloc(sizeof(Oid) * 1);
+			TypeCacheEntry *tcache;
+
+			d_desc = CreateTemplateTupleDesc(1);
+			TupleDescInitEntry(d_desc, 1, "k", relatt->atttypid,
+							   relatt->atttypmod, 0);
+			TupleDescInitEntryCollation(d_desc, 1, relatt->attcollation);
+			TupleDescFinalize(d_desc);
+
+			tcache = lookup_type_cache(relatt->atttypid,
+									   TYPECACHE_EQ_OPR);
+			if (!OidIsValid(tcache->eq_opr))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_FUNCTION),
+						 errmsg("type %s has no default equality operator",
+								format_type_be(relatt->atttypid))));
+			eqOps[0] = tcache->eq_opr;
+			execTuplesHashPrepare(1, eqOps, &eqfuncoids, &hashfunctions);
+			colls[0] = src->col_collation;
+
+			state->aggs[i].distinct_desc = d_desc;
+			state->aggs[i].distinct_slot =
+				MakeSingleTupleTableSlot(d_desc, &TTSOpsVirtual);
+			state->aggs[i].distinct_eqfn = eqfuncoids;
+			state->aggs[i].distinct_hashfn = hashfunctions;
+			state->aggs[i].distinct_coll = colls;
+			cs_agg_ensure_hash_cxts(state, estate);
+			state->aggs[i].distinct_hash =
+				BuildTupleHashTable(&node->ss.ps,
+									d_desc, &TTSOpsVirtual,
+									1, keyColIdx,
+									eqfuncoids, hashfunctions,
+									colls, 1024,
+									0,	/* no per-entry payload needed */
+									estate->es_query_cxt,
+									state->hash_tuplescxt,
+									state->hash_tempcxt,
+									false);
+			pfree(eqOps);
+		}
+
+		i++;
+	}
+
+	/*
+	 * Forward the WHERE clauses both as zone-map / qual-key pushdown to the
+	 * AM (cheap row-group skipping) and as a residual ExprState for any
+	 * clauses the qual-key extractor couldn't translate.
+	 */
+	if (baseclauses != NIL)
+	{
+		List	   *vars;
+
+		nqual_keys = cs_extract_scan_qual_keys(baseclauses,
+											   cscan->scan.scanrelid,
+											   &qual_keys);
+
+		/*
+		 * Mark every column referenced by the WHERE quals as needed so
+		 * scan_set_projection lets the AM materialize them for the residual
+		 * ExprState evaluation below.
+		 */
+		vars = pull_var_clause((Node *) baseclauses, 0);
+		foreach(lc, vars)
+		{
+			Var		   *v = (Var *) lfirst(lc);
+
+			if (v->varno == cscan->scan.scanrelid && v->varattno > 0)
+				needed_cols = bms_add_member(needed_cols, v->varattno - 1);
+		}
+
+		/*
+		 * ExecPrepareQual compiles with parent=NULL, so the
+		 * EEOP_SCAN_FETCHSOME setup step doesn't try to optimize against our
+		 * CustomScanState's scandesc (which describes the agg output
+		 * tupledesc, not the columnstore relation tupledesc that the Vars in
+		 * baseclauses reference).  At runtime ExecQual reads column values
+		 * via slot_getsomeattrs on whatever slot we put in
+		 * econtext->ecxt_scantuple -- that's probe_slot.
+		 */
+		state->qual_state = ExecPrepareQual(baseclauses, estate);
+	}
+
+	if (needed_cols != NULL)
+	{
+		cs_scan_set_projection(state->scandesc, needed_cols);
+		bms_free(needed_cols);
+	}
+
+	if (nqual_keys > 0)
+	{
+		cs_scan_set_qual_keys(state->scandesc, nqual_keys, qual_keys);
+		pfree(qual_keys);
+	}
+
+	state->probe_slot = MakeSingleTupleTableSlot(RelationGetDescr(rel),
+												 &TTSOpsColumnStore);
+	state->emitted = false;
+	state->exhausted = false;
+
+	/*
+	 * If any output positions are GROUP_KEY, set up a TupleHashTable keyed on
+	 * those columns.  Per-entry additional area carries CSAggGroupState with
+	 * one CSAggOne per output position (group keys are unused there but the
+	 * array indices line up with state->aggs for simplicity).
+	 */
+	state->ngrpkeys = 0;
+	for (i = 0; i < state->nagg; i++)
+		if (state->aggs[i].kind == CS_AGG_GROUP_KEY)
+			state->ngrpkeys++;
+
+	if (state->ngrpkeys > 0)
+	{
+		TupleDesc	grpdesc;
+		AttrNumber *keyColIdx;
+		Oid		   *eqfuncoids;
+		Oid		   *collations;
+		Oid		   *eqOps;
+		FmgrInfo   *hashfunctions;
+		int			k = 0;
+
+		state->grpkey_outpos = palloc(sizeof(int) * state->ngrpkeys);
+		state->grpkey_attnos = palloc(sizeof(AttrNumber) * state->ngrpkeys);
+		grpdesc = CreateTemplateTupleDesc(state->ngrpkeys);
+		keyColIdx = palloc(sizeof(AttrNumber) * state->ngrpkeys);
+		collations = palloc(sizeof(Oid) * state->ngrpkeys);
+
+		for (i = 0; i < state->nagg; i++)
+		{
+			CSAggOne   *a = &state->aggs[i];
+			Form_pg_attribute relatt;
+
+			if (a->kind != CS_AGG_GROUP_KEY)
+				continue;
+
+			state->grpkey_outpos[k] = i;
+			state->grpkey_attnos[k] = a->col_attno;
+			relatt = TupleDescAttr(RelationGetDescr(rel), a->col_attno - 1);
+			TupleDescInitEntry(grpdesc, (AttrNumber) (k + 1),
+							   NameStr(relatt->attname),
+							   relatt->atttypid, relatt->atttypmod, 0);
+			TupleDescInitEntryCollation(grpdesc, (AttrNumber) (k + 1),
+										relatt->attcollation);
+			keyColIdx[k] = (AttrNumber) (k + 1);
+			collations[k] = relatt->attcollation;
+			k++;
+		}
+
+		/*
+		 * Finalize before the desc backs a slot: the grouped emit path
+		 * deforms the hash table's minimal tuples through grp_slot's
+		 * descriptor (ExecForceStoreMinimalTuple), and heap_deform_tuple
+		 * asserts the offset cache was computed.  Matches the other
+		 * hand-built descriptors (d_desc, the late-mat probe_desc).
+		 */
+		TupleDescFinalize(grpdesc);
+
+		state->grp_slot = MakeSingleTupleTableSlot(grpdesc, &TTSOpsVirtual);
+
+		/*
+		 * Equality and hash functions per group-key column.  Pull the default
+		 * eq operator out of the type cache directly -- avoids the
+		 * operator-by-name lookup compatible_oper_opid would do.
+		 */
+		eqOps = palloc(sizeof(Oid) * state->ngrpkeys);
+		for (k = 0; k < state->ngrpkeys; k++)
+		{
+			Oid			typid = TupleDescAttr(grpdesc, k)->atttypid;
+			TypeCacheEntry *tcache;
+
+			tcache = lookup_type_cache(typid, TYPECACHE_EQ_OPR);
+			if (!OidIsValid(tcache->eq_opr))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_FUNCTION),
+						 errmsg("type %s has no default equality operator",
+								format_type_be(typid))));
+			eqOps[k] = tcache->eq_opr;
+		}
+		execTuplesHashPrepare(state->ngrpkeys, eqOps,
+							  &eqfuncoids, &hashfunctions);
+		pfree(eqOps);
+
+		cs_agg_ensure_hash_cxts(state, estate);
+		state->grouphash = BuildTupleHashTable(&node->ss.ps,
+											   grpdesc, &TTSOpsVirtual,
+											   state->ngrpkeys,
+											   keyColIdx,
+											   eqfuncoids,
+											   hashfunctions,
+											   collations,
+											   1024,
+											   sizeof(CSAggGroupState),
+											   estate->es_query_cxt,
+											   state->hash_tuplescxt,
+											   state->hash_tempcxt,
+											   false);
+		state->grp_iter_started = false;
+	}
+}
+
+/*
+ * Apply per-row accumulation against a CSAggOne descriptor + slot.
+ *
+ * `scan` is the columnstore TableScanDesc used to drive `slot`; it is
+ * only consulted by the SUM/AVG numeric fast path which needs to query
+ * the column's NI64 encoding via cs_scan_get_raw_attr.
+ *
+ * `econtext` is consulted only when the aggregate has a FILTER clause;
+ * in that case the caller is expected to have set ecxt_scantuple = slot
+ * (which the WHERE-residual path already does for the same row).
+ */
+static void
+cs_agg_accum_row(CSAggOne *a, TableScanDesc scan, TupleTableSlot *slot,
+				 ExprContext *econtext)
+{
+	Datum		val;
+	bool		isnull;
+
+	if (a->kind == CS_AGG_GROUP_KEY ||
+		a->kind == CS_AGG_PASSTHROUGH ||
+		a->col_attno < 0)
+		return;
+
+	/*
+	 * Aggregate-level FILTER (WHERE ...) -- skip the row for THIS aggregate
+	 * if the filter is false.  The filter's Vars reference the relation's
+	 * tupledesc; the caller has already set econtext->ecxt_scantuple to the
+	 * probe slot.
+	 */
+	if (a->filter_state != NULL && econtext != NULL)
+	{
+		if (!ExecQual(a->filter_state, econtext))
+			return;
+	}
+
+	/*
+	 * COUNT(*) -- a->col_attno == 0 means the aggregate references no column.
+	 * Increment unconditionally and bypass slot_getattr, which would do
+	 * nothing useful for attno=0 anyway.
+	 */
+	if (a->kind == CS_AGG_COUNT && a->col_attno == 0)
+	{
+		a->count++;
+		return;
+	}
+
+	/*
+	 * COUNT(DISTINCT col) -- look up the value in the per-group hash set;
+	 * increment count only when isnew=true.  NULL inputs are skipped (SQL
+	 * standard: NULL not counted by DISTINCT).
+	 */
+	if (a->kind == CS_AGG_COUNT_DISTINCT)
+	{
+		Datum		dv;
+		bool		dnull;
+		bool		isnew;
+
+		dv = slot_getattr(slot, a->col_attno, &dnull);
+		if (dnull)
+			return;
+
+		ExecClearTuple(a->distinct_slot);
+		a->distinct_slot->tts_values[0] = dv;
+		a->distinct_slot->tts_isnull[0] = false;
+		ExecStoreVirtualTuple(a->distinct_slot);
+
+		(void) LookupTupleHashEntry(a->distinct_hash, a->distinct_slot,
+									&isnew, NULL);
+		if (isnew)
+			a->count++;
+		return;
+	}
+
+	if (a->kind == CS_AGG_SUM_NUMERIC || a->kind == CS_AGG_AVG_NUMERIC)
+	{
+		Datum		raw_val;
+		bool		raw_isnull;
+
+		/*
+		 * NI64 fast path: when the numeric column is stored as a scaled
+		 * int64, accumulate raw int64 values into an int128 sum.  The per-row
+		 * int64 -> Numeric conversion (~50ns) is replaced by an int128 +=
+		 * int64 operation (~1ns), an order-of-magnitude win on
+		 * SUM/AVG-over-numeric workloads where it matters most.
+		 */
+		if (cs_scan_get_raw_attr(scan, slot, a->col_attno,
+								 &raw_val, &raw_isnull))
+		{
+			Oid			phys_type = InvalidOid;
+			int32		dscale = -1;
+
+			/*
+			 * The dscale belongs to the current row group -- the encoder
+			 * picks it per row group, so an unconstrained numeric column can
+			 * change scale as the scan moves between groups.  Refetch it
+			 * every time, and rescale whichever of the running sum and the
+			 * incoming value has the smaller scale when they differ.
+			 */
+			(void) cs_scan_column_encoding(scan, a->col_attno,
+										   &phys_type, &dscale);
+			if (dscale < 0)
+				dscale = 0;
+			if (!a->ni64_active)
+			{
+				a->dscale = dscale;
+				a->ni64_active = true;
+			}
+			if (!raw_isnull)
+			{
+				int128		v = (int128) DatumGetInt64(raw_val);
+
+				if (unlikely(dscale != a->dscale))
+				{
+					if (dscale > a->dscale)
+					{
+						/*
+						 * Scale the running sum up to the incoming chunk's
+						 * dscale.  a->dscale is advanced in step with each
+						 * multiplication so that a mid-loop flush converts
+						 * the sum at its true scale, not the original one.
+						 */
+						while (a->dscale < dscale)
+						{
+							if (a->sumX > CS_NI64_RESCALE_LIMIT ||
+								a->sumX < -CS_NI64_RESCALE_LIMIT)
+							{
+								cs_agg_ni64_flush(a);
+								/* the sum is zero now; it scales freely */
+								a->dscale = dscale;
+								break;
+							}
+							a->sumX *= 10;
+							a->dscale++;
+						}
+					}
+					else
+					{
+						int32		vscale = dscale;
+
+						while (vscale < a->dscale)
+						{
+							if (v > CS_NI64_RESCALE_LIMIT ||
+								v < -CS_NI64_RESCALE_LIMIT)
+								break;
+							v *= 10;
+							vscale++;
+						}
+						if (vscale < a->dscale)
+						{
+							/*
+							 * The incoming value cannot reach the
+							 * accumulator's scale in int128.  Add it through
+							 * the Numeric accumulator at the scale it is
+							 * actually at; the emit path merges both sides.
+							 */
+							cs_agg_num_acc_add(a,
+											   cs_int128_to_numeric(v,
+																	vscale));
+							a->saw_value = true;
+							if (a->kind == CS_AGG_AVG_NUMERIC)
+								a->count++;
+							return;
+						}
+					}
+				}
+
+				/*
+				 * Guard the addition too: after a rescale either side can sit
+				 * just past the limit (one multiply beyond it), and a run of
+				 * such rows would overflow int128 within a few additions.
+				 * Flushing first keeps every sum reachable here below ~2^126.
+				 */
+				if (a->sumX > CS_NI64_RESCALE_LIMIT ||
+					a->sumX < -CS_NI64_RESCALE_LIMIT ||
+					v > CS_NI64_RESCALE_LIMIT ||
+					v < -CS_NI64_RESCALE_LIMIT)
+					cs_agg_ni64_flush(a);
+				a->sumX += v;
+				a->saw_value = true;
+				if (a->kind == CS_AGG_AVG_NUMERIC)
+					a->count++;
+			}
+			return;
+		}
+		/* Fall through to the generic numeric_add path below. */
+	}
+
+	val = slot_getattr(slot, a->col_attno, &isnull);
+	if (isnull && a->count_skips_null)
+		return;
+
+	switch (a->kind)
+	{
+		case CS_AGG_COUNT:
+			if (!isnull)
+				a->count++;
+			break;
+		case CS_AGG_SUM_NUMERIC:
+		case CS_AGG_AVG_NUMERIC:
+			if (!isnull)
+			{
+				cs_agg_num_acc_add(a, DatumGetNumericCopy(val));
+				a->saw_value = true;
+				if (a->kind == CS_AGG_AVG_NUMERIC)
+					a->count++;
+			}
+			break;
+		case CS_AGG_SUM_INT:
+		case CS_AGG_SUM_INT8:
+		case CS_AGG_AVG_INT:
+			if (!isnull)
+			{
+				int64		ival;
+
+				switch (a->col_type)
+				{
+					case INT2OID:
+						ival = (int64) DatumGetInt16(val);
+						break;
+					case INT4OID:
+						ival = (int64) DatumGetInt32(val);
+						break;
+					case INT8OID:
+						ival = DatumGetInt64(val);
+						break;
+					default:
+						ival = 0;
+						break;
+				}
+				a->sumX += (int128) ival;
+				a->saw_value = true;
+				if (a->kind == CS_AGG_AVG_INT)
+					a->count++;
+			}
+			break;
+		case CS_AGG_MIN:
+		case CS_AGG_MAX:
+			if (isnull)
+				break;
+			if (a->first_row)
+			{
+				a->minmax = datumCopy(val, a->col_typbyval, a->col_typlen);
+				a->minmax_isnull = false;
+				a->first_row = false;
+			}
+			else
+			{
+				int32		cmp_int;
+				bool		replace;
+
+				cmp_int = DatumGetInt32(FunctionCall2Coll(a->cmp_finfo,
+														  a->col_collation,
+														  val, a->minmax));
+				replace = (a->kind == CS_AGG_MIN)
+					? cmp_int < 0 : cmp_int > 0;
+				if (replace)
+				{
+					if (!a->col_typbyval && DatumGetPointer(a->minmax) != NULL)
+						pfree(DatumGetPointer(a->minmax));
+					a->minmax = datumCopy(val, a->col_typbyval, a->col_typlen);
+				}
+			}
+			break;
+		default:
+			break;
+	}
+}
+
+/* Materialize one CSAggOne's finalized output value into a slot position. */
+static void
+cs_agg_emit_one(CSAggOne *a, TupleTableSlot *out, int outpos)
+{
+	switch (a->kind)
+	{
+		case CS_AGG_COUNT:
+		case CS_AGG_COUNT_DISTINCT:
+			out->tts_values[outpos] = Int64GetDatum(a->count);
+			out->tts_isnull[outpos] = false;
+			break;
+		case CS_AGG_SUM_NUMERIC:
+			if (a->saw_value)
+			{
+				Numeric		sum;
+
+				if (a->ni64_active && a->num_acc_valid)
+				{
+					Numeric		ni_part = cs_int128_to_numeric(a->sumX,
+															   a->dscale);
+					Datum		merged = DirectFunctionCall2(numeric_add,
+															 NumericGetDatum(a->num_acc),
+															 NumericGetDatum(ni_part));
+
+					sum = DatumGetNumericCopy(merged);
+				}
+				else if (a->ni64_active)
+					sum = cs_int128_to_numeric(a->sumX, a->dscale);
+				else
+					sum = a->num_acc;
+
+				out->tts_values[outpos] = NumericGetDatum(sum);
+				out->tts_isnull[outpos] = false;
+			}
+			else
+				out->tts_isnull[outpos] = true;
+			break;
+		case CS_AGG_AVG_NUMERIC:
+			if (a->saw_value && a->count > 0)
+			{
+				Numeric		sum;
+				Datum		count_d;
+				Datum		avg;
+
+				if (a->ni64_active && a->num_acc_valid)
+				{
+					Numeric		ni_part = cs_int128_to_numeric(a->sumX,
+															   a->dscale);
+					Datum		merged = DirectFunctionCall2(numeric_add,
+															 NumericGetDatum(a->num_acc),
+															 NumericGetDatum(ni_part));
+
+					sum = DatumGetNumericCopy(merged);
+				}
+				else if (a->ni64_active)
+					sum = cs_int128_to_numeric(a->sumX, a->dscale);
+				else
+					sum = a->num_acc;
+
+				count_d = DirectFunctionCall1(int8_numeric,
+											  Int64GetDatum(a->count));
+				avg = DirectFunctionCall2(numeric_div,
+										  NumericGetDatum(sum), count_d);
+
+				out->tts_values[outpos] = avg;
+				out->tts_isnull[outpos] = false;
+			}
+			else
+				out->tts_isnull[outpos] = true;
+			break;
+		case CS_AGG_SUM_INT:
+			if (a->saw_value)
+			{
+				/*
+				 * SUM(int2)/SUM(int4) returns int8.  Range-check the int128
+				 * accumulator to match heap behaviour: PG's int4_sum throws
+				 * "bigint out of range" on overflow.
+				 */
+				if (a->sumX > (int128) PG_INT64_MAX ||
+					a->sumX < (int128) PG_INT64_MIN)
+					ereport(ERROR,
+							(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+							 errmsg("bigint out of range")));
+				out->tts_values[outpos] = Int64GetDatum((int64) a->sumX);
+				out->tts_isnull[outpos] = false;
+			}
+			else
+				out->tts_isnull[outpos] = true;
+			break;
+		case CS_AGG_SUM_INT8:
+			if (a->saw_value)
+			{
+				out->tts_values[outpos] = NumericGetDatum(
+														  cs_int128_to_numeric(a->sumX, 0));
+				out->tts_isnull[outpos] = false;
+			}
+			else
+				out->tts_isnull[outpos] = true;
+			break;
+		case CS_AGG_AVG_INT:
+			if (a->saw_value && a->count > 0)
+			{
+				Numeric		sum = cs_int128_to_numeric(a->sumX, 0);
+				Datum		count_d = DirectFunctionCall1(int8_numeric,
+														  Int64GetDatum(a->count));
+				Datum		avg = DirectFunctionCall2(numeric_div,
+													  NumericGetDatum(sum),
+													  count_d);
+
+				out->tts_values[outpos] = avg;
+				out->tts_isnull[outpos] = false;
+			}
+			else
+				out->tts_isnull[outpos] = true;
+			break;
+		case CS_AGG_MIN:
+		case CS_AGG_MAX:
+			if (a->first_row)
+				out->tts_isnull[outpos] = true;
+			else
+			{
+				out->tts_values[outpos] = a->minmax;
+				out->tts_isnull[outpos] = false;
+			}
+			break;
+		default:
+			out->tts_isnull[outpos] = true;
+			break;
+	}
+}
+
+static TupleTableSlot *
+cs_agg_exec(CustomScanState *node)
+{
+	CSAggState *state = (CSAggState *) node;
+	TupleTableSlot *scan_slot = node->ss.ss_ScanTupleSlot;
+	int			i;
+
+	/*
+	 * GROUP BY path: drain the input and bucket per group.  After scan
+	 * completes, iterate the hash table emitting one row per group.
+	 */
+	if (state->grouphash != NULL)
+	{
+		ExprContext *econtext = node->ss.ps.ps_ExprContext;
+
+		if (!state->exhausted)
+		{
+			while (true)
+			{
+				TupleTableSlot *slot = state->probe_slot;
+				TupleHashEntry entry;
+				CSAggGroupState *gstate;
+				bool		isnew;
+				int			k;
+
+				if (!table_scan_getnextslot(state->scandesc,
+											ForwardScanDirection, slot))
+				{
+					state->exhausted = true;
+					break;
+				}
+				if (state->qual_state != NULL)
+				{
+					econtext->ecxt_scantuple = slot;
+					if (!ExecQual(state->qual_state, econtext))
+						continue;
+				}
+
+				/*
+				 * Build the lookup tuple: copy group-key columns into
+				 * grp_slot.
+				 */
+				ExecClearTuple(state->grp_slot);
+				for (k = 0; k < state->ngrpkeys; k++)
+				{
+					bool		isnull;
+					Datum		v = slot_getattr(slot,
+												 state->grpkey_attnos[k],
+												 &isnull);
+
+					state->grp_slot->tts_values[k] = v;
+					state->grp_slot->tts_isnull[k] = isnull;
+				}
+				ExecStoreVirtualTuple(state->grp_slot);
+
+				entry = LookupTupleHashEntry(state->grouphash,
+											 state->grp_slot,
+											 &isnew, NULL);
+				gstate = (CSAggGroupState *) TupleHashEntryGetAdditional(state->grouphash, entry);
+
+				if (isnew)
+				{
+					/* Initialize per-group accumulators from the template. */
+					gstate->aggs = palloc(sizeof(CSAggOne) * state->nagg);
+					for (i = 0; i < state->nagg; i++)
+					{
+						AttrNumber	d_keyColIdx[1] = {1};
+
+						gstate->aggs[i] = state->aggs[i];
+						gstate->aggs[i].count = 0;
+						gstate->aggs[i].num_acc_valid = false;
+						gstate->aggs[i].sumX = 0;
+						gstate->aggs[i].ni64_active = false;
+						gstate->aggs[i].saw_value = false;
+						gstate->aggs[i].first_row = true;
+						gstate->aggs[i].minmax_isnull = true;
+
+						/*
+						 * COUNT(DISTINCT col): each group gets its own hash
+						 * set.  Reuse the desc/eq/hash funcs from the
+						 * template (set up once in cs_agg_begin); a smaller
+						 * initial bucket count is fine -- many groups means
+						 * the dedup set per group is small.
+						 */
+						if (state->aggs[i].kind == CS_AGG_COUNT_DISTINCT)
+						{
+							gstate->aggs[i].distinct_hash =
+								BuildTupleHashTable(&node->ss.ps,
+													state->aggs[i].distinct_desc,
+													&TTSOpsVirtual,
+													1, d_keyColIdx,
+													state->aggs[i].distinct_eqfn,
+													state->aggs[i].distinct_hashfn,
+													state->aggs[i].distinct_coll,
+													64, 0,
+													node->ss.ps.state->es_query_cxt,
+													state->hash_tuplescxt,
+													state->hash_tempcxt,
+													false);
+						}
+					}
+				}
+
+				/*
+				 * Set ecxt_scantuple so per-aggregate FILTER ExprStates can
+				 * fetch column values from probe_slot.
+				 */
+				econtext->ecxt_scantuple = slot;
+				for (i = 0; i < state->nagg; i++)
+					cs_agg_accum_row(&gstate->aggs[i],
+									 state->scandesc, slot, econtext);
+
+				/* Discard per-lookup scratch from this row's hash probes. */
+				MemoryContextReset(state->hash_tempcxt);
+			}
+		}
+
+		/* Iterate hash table to emit results. */
+		if (!state->grp_iter_started)
+		{
+			InitTupleHashIterator(state->grouphash, &state->grp_iter);
+			state->grp_iter_started = true;
+		}
+		while (true)
+		{
+			TupleHashEntry entry = ScanTupleHashTable(state->grouphash,
+													  &state->grp_iter);
+			MinimalTuple mtup;
+			CSAggGroupState *gstate;
+
+			if (entry == NULL)
+				return NULL;
+
+			mtup = TupleHashEntryGetTuple(entry);
+			gstate = (CSAggGroupState *) TupleHashEntryGetAdditional(state->grouphash, entry);
+
+			ExecClearTuple(scan_slot);
+
+			/*
+			 * grp_slot is a TTSOpsVirtual slot, so use the force variant to
+			 * materialize the hash entry's minimal tuple's values into
+			 * tts_values/isnull.
+			 */
+			ExecForceStoreMinimalTuple(mtup, state->grp_slot, false);
+			slot_getallattrs(state->grp_slot);
+
+			for (i = 0; i < state->nagg; i++)
+			{
+				CSAggOne   *a = &state->aggs[i];
+
+				if (a->kind == CS_AGG_GROUP_KEY)
+				{
+					/* Find this output position in grpkey_outpos. */
+					int			k;
+
+					for (k = 0; k < state->ngrpkeys; k++)
+					{
+						if (state->grpkey_outpos[k] == i)
+						{
+							scan_slot->tts_values[i] = state->grp_slot->tts_values[k];
+							scan_slot->tts_isnull[i] = state->grp_slot->tts_isnull[k];
+							break;
+						}
+					}
+				}
+				else
+				{
+					cs_agg_emit_one(&gstate->aggs[i], scan_slot, i);
+				}
+			}
+			ExecStoreVirtualTuple(scan_slot);
+
+			/*
+			 * Apply HAVING.  setrefs.c rewrote any Aggref / group-Var
+			 * references in plan->qual against custom_scan_tlist with
+			 * INDEX_VAR, so ExecQual reads slot positions from scan_slot
+			 * directly without re-evaluating aggregates.  Groups that fail
+			 * are skipped and the next hash entry is fetched.
+			 */
+			if (node->ss.ps.qual != NULL)
+			{
+				econtext->ecxt_scantuple = scan_slot;
+				if (!ExecQual(node->ss.ps.qual, econtext))
+					continue;
+			}
+
+			if (node->ss.ps.ps_ProjInfo != NULL)
+			{
+				econtext->ecxt_scantuple = scan_slot;
+				return ExecProject(node->ss.ps.ps_ProjInfo);
+			}
+			return scan_slot;
+		}
+	}
+
+	if (state->emitted)
+		return NULL;
+
+	/* Drain the underlying scan, accumulating per-aggregate state. */
+	while (!state->exhausted)
+	{
+		TupleTableSlot *slot = state->probe_slot;
+		ExprContext *econtext = node->ss.ps.ps_ExprContext;
+
+		if (!table_scan_getnextslot(state->scandesc, ForwardScanDirection,
+									slot))
+		{
+			state->exhausted = true;
+			break;
+		}
+
+		/* Apply residual WHERE clauses; skip non-matching rows. */
+		if (state->qual_state != NULL)
+		{
+			econtext->ecxt_scantuple = slot;
+			if (!ExecQual(state->qual_state, econtext))
+				continue;
+		}
+
+		econtext->ecxt_scantuple = slot;
+		for (i = 0; i < state->nagg; i++)
+			cs_agg_accum_row(&state->aggs[i], state->scandesc, slot,
+							 econtext);
+
+		/*
+		 * Discard per-lookup scratch from this row's COUNT(DISTINCT) hash
+		 * probes; NULL when no such aggregate is present.
+		 */
+		if (state->hash_tempcxt != NULL)
+			MemoryContextReset(state->hash_tempcxt);
+	}
+
+	/*
+	 * Build the single output tuple in ss_ScanTupleSlot.  The slot's
+	 * tupledesc has one attribute per custom_scan_tlist entry, in order. The
+	 * plan-tlist Vars (varno=INDEX_VAR) reference those attributes, and the
+	 * executor's standard projection (set up by ExecInitCustomScan because
+	 * plan tlist != custom_scan_tlist) maps from the scan slot to the result
+	 * slot.
+	 */
+	ExecClearTuple(scan_slot);
+	for (i = 0; i < state->nagg; i++)
+	{
+		CSAggOne   *a = &state->aggs[i];
+
+		if (a->col_attno < 0)
+		{
+			scan_slot->tts_isnull[i] = true;
+			continue;
+		}
+		cs_agg_emit_one(a, scan_slot, i);
+	}
+	ExecStoreVirtualTuple(scan_slot);
+
+	state->emitted = true;
+
+	/* HAVING applies even in the ungrouped case (e.g., HAVING count(*) > 0). */
+	if (node->ss.ps.qual != NULL)
+	{
+		ExprContext *econtext = node->ss.ps.ps_ExprContext;
+
+		econtext->ecxt_scantuple = scan_slot;
+		if (!ExecQual(node->ss.ps.qual, econtext))
+			return NULL;
+	}
+
+	/*
+	 * If the executor set up a projection, run it; otherwise return scan
+	 * slot.
+	 */
+	if (node->ss.ps.ps_ProjInfo != NULL)
+	{
+		ExprContext *econtext = node->ss.ps.ps_ExprContext;
+
+		econtext->ecxt_scantuple = scan_slot;
+		return ExecProject(node->ss.ps.ps_ProjInfo);
+	}
+	return scan_slot;
+}
+
+static void
+cs_agg_end(CustomScanState *node)
+{
+	CSAggState *state = (CSAggState *) node;
+
+	if (state->scandesc != NULL)
+	{
+		table_endscan(state->scandesc);
+		state->scandesc = NULL;
+	}
+	if (state->probe_slot != NULL)
+	{
+		ExecDropSingleTupleTableSlot(state->probe_slot);
+		state->probe_slot = NULL;
+	}
+}
+
+static void
+cs_agg_rescan(CustomScanState *node)
+{
+	CSAggState *state = (CSAggState *) node;
+
+	if (state->scandesc != NULL)
+		table_rescan(state->scandesc, NULL);
+	state->emitted = false;
+	state->exhausted = false;
+	for (int i = 0; i < state->nagg; i++)
+	{
+		state->aggs[i].count = 0;
+		state->aggs[i].num_acc_valid = false;
+		state->aggs[i].sumX = 0;
+		state->aggs[i].ni64_active = false;
+		state->aggs[i].saw_value = false;
+		state->aggs[i].first_row = true;
+		state->aggs[i].minmax_isnull = true;
+
+		/* DISTINCT sets must restart with the new parameter values */
+		if (state->aggs[i].distinct_hash != NULL)
+			ResetTupleHashTable(state->aggs[i].distinct_hash);
+	}
+
+	/*
+	 * Grouped state: the hash of groups and the emit iterator belong to the
+	 * previous execution; correlated rescans would otherwise emit stale
+	 * groups (or nothing, with the iterator already exhausted).
+	 */
+	state->grp_iter_started = false;
+	if (state->grouphash != NULL)
+		ResetTupleHashTable(state->grouphash);
+	if (state->hash_tempcxt != NULL)
+		MemoryContextReset(state->hash_tempcxt);
+}
+
+/*
+ * Display labels for EXPLAIN output, indexed by CSAggKind.
+ * NULL entries (e.g. CS_AGG_PASSTHROUGH) cause the explain loop to skip
+ * the aggregate descriptor.
+ */
+static const char *const cs_agg_kind_names[] = {
+	[CS_AGG_COUNT] = "count",
+	[CS_AGG_COUNT_DISTINCT] = "count_distinct",
+	[CS_AGG_SUM_NUMERIC] = "sum_numeric",
+	[CS_AGG_AVG_NUMERIC] = "avg_numeric",
+	[CS_AGG_SUM_INT] = "sum_int",
+	[CS_AGG_SUM_INT8] = "sum_int8",
+	[CS_AGG_AVG_INT] = "avg_int",
+	[CS_AGG_MIN] = "min",
+	[CS_AGG_MAX] = "max",
+	[CS_AGG_GROUP_KEY] = "group_by",
+	[CS_AGG_PASSTHROUGH] = NULL,
+};
+
+static void
+cs_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	CSAggState *state = (CSAggState *) node;
+	StringInfoData buf;
+	bool		first = true;
+
+	initStringInfo(&buf);
+	for (int i = 0; i < state->nagg; i++)
+	{
+		const char *kind;
+
+		if (state->aggs[i].col_attno < 0)
+			continue;
+		if (state->aggs[i].kind >= lengthof(cs_agg_kind_names))
+			continue;
+		kind = cs_agg_kind_names[state->aggs[i].kind];
+		if (kind == NULL)
+			continue;
+		if (!first)
+			appendStringInfoString(&buf, ", ");
+		appendStringInfo(&buf, "%s(att=%d)", kind, state->aggs[i].col_attno);
+		first = false;
+	}
+	if (buf.len > 0)
+		ExplainPropertyText("Columnstore Aggregates", buf.data, es);
+	pfree(buf.data);
+}
+
+/* ========================================================================
+ * Late materialization for ORDER BY + LIMIT (the "ColumnstoreLateMat"
+ * CustomScan).
+ *
+ * For a query of the shape
+ *
+ *     SELECT cols... FROM cs_table
+ *     ORDER BY sort_col [, ...] LIMIT N
+ *
+ * the standard plan materializes EVERY column for EVERY row before
+ * sorting, then keeps only N rows.  The late-mat plan emits only
+ * (sort_col_values, ItemPointer) into a top-N tuplesort, then for each
+ * of the N surviving tuples refetches the projected columns by TID.
+ * Wide tables with selective LIMIT see large speedups: the heavy column
+ * decompression cost is paid for only N rows, not for the whole table.
+ *
+ * Implementation: tuplesort_begin_heap with bound = LIMIT keeps a
+ * top-N min-heap.  After scan completes, we drain the sorted output and
+ * for each (sort_col..., tid) tuple we call table_tuple_fetch_row_version
+ * to materialize the full row, then ExecProject to deliver the
+ * caller's targetlist.
+ * ========================================================================
+ */
+
+#include "access/heapam.h"
+#include "access/sysattr.h"
+#include "miscadmin.h"
+#include "utils/guc.h"
+#include "utils/tuplesort.h"
+
+
+typedef struct CSLatemat
+{
+	int			scanrelid;		/* base rel rti */
+	int			n_sort;			/* number of ORDER BY keys */
+	AttrNumber *sort_attnos;	/* input rel attnos for each sort key */
+	Oid		   *sort_collations;
+	Oid		   *sort_operators;
+	bool	   *sort_nulls_first;
+	int64		limit_n;
+} CSLatemat;
+
+typedef struct CSLatematState
+{
+	CustomScanState css;		/* must be first */
+	TableScanDesc scandesc;
+	Relation	rel;
+	CSLatemat	plan_info;
+	Tuplesortstate *sortstate;
+	TupleDesc	probe_desc;		/* narrow desc: sort_keys + tid */
+	TupleTableSlot *probe_slot; /* slot pushed into tuplesort */
+	TupleTableSlot *sort_slot;	/* slot tuplesort hands back */
+	TupleTableSlot *scan_slot;	/* slot for raw scan output (full row) */
+	ExprState  *qual_state;		/* per-row residual filter, or NULL */
+	int64		emitted;
+	bool		populated;
+} CSLatematState;
+
+static void
+cs_try_add_latemat_path(PlannerInfo *root, RelOptInfo *input_rel,
+						RelOptInfo *output_rel)
+{
+	Query	   *parse = root->parse;
+	RangeTblEntry *rte;
+	List	   *tlist;
+	CustomPath *cpath;
+	CSLatemat  *info;
+	Path	   *cheapest;
+	Const	   *limit_const;
+	List	   *baseclauses;
+	ListCell   *lc2;
+	int			n_sort;
+	int			i;
+	ListCell   *lc;
+	int64		limit_n;
+
+	/* Need ORDER BY + LIMIT.  No GROUP BY / aggregation / windows here. */
+	if (parse->sortClause == NIL || parse->limitCount == NULL)
+		return;
+	if (parse->groupClause != NIL || parse->groupingSets != NIL ||
+		parse->hasAggs || parse->hasWindowFuncs || parse->hasTargetSRFs ||
+		parse->havingQual != NULL)
+		return;
+	if (parse->limitOption != LIMIT_OPTION_COUNT)
+		return;
+	if (!IsA(parse->limitCount, Const))
+		return;
+	limit_const = (Const *) parse->limitCount;
+	if (limit_const->constisnull || limit_const->consttype != INT8OID)
+		return;
+	limit_n = DatumGetInt64(limit_const->constvalue);
+	if (limit_n <= 0 || limit_n > 100000)
+		return;					/* sanity guard */
+	if (parse->limitOffset != NULL)
+		return;					/* don't bother for now */
+	if (parse->rowMarks != NIL)
+		return;					/* FOR UPDATE et al. need real ctids */
+
+	if (!cs_upper_input_is_columnstore_rel(root, input_rel, &rte))
+		return;
+
+	cheapest = input_rel->cheapest_total_path;
+	if (cheapest == NULL)
+		return;
+
+	/* Every ORDER BY key must be a Var on the input rel. */
+	tlist = parse->targetList;
+	n_sort = list_length(parse->sortClause);
+	info = palloc(sizeof(CSLatemat));
+	info->scanrelid = input_rel->relid;
+	info->n_sort = n_sort;
+	info->sort_attnos = palloc(sizeof(AttrNumber) * n_sort);
+	info->sort_collations = palloc(sizeof(Oid) * n_sort);
+	info->sort_operators = palloc(sizeof(Oid) * n_sort);
+	info->sort_nulls_first = palloc(sizeof(bool) * n_sort);
+	info->limit_n = limit_n;
+
+	i = 0;
+	foreach(lc, parse->sortClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sgc, tlist);
+		Var		   *v;
+
+		if (!IsA(tle->expr, Var))
+			return;
+		v = (Var *) tle->expr;
+		if (v->varno != input_rel->relid)
+			return;
+
+		/* only user columns: no system attributes or whole-row refs */
+		if (v->varattno <= 0)
+			return;
+
+		info->sort_attnos[i] = v->varattno;
+		info->sort_collations[i] = exprCollation((Node *) v);
+		info->sort_operators[i] = sgc->sortop;
+		info->sort_nulls_first[i] = sgc->nulls_first;
+		i++;
+	}
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = output_rel;
+
+	/*
+	 * At UPPERREL_ORDERED-stage hook time, output_rel->reltarget is still
+	 * empty; the actual target shape lives in root->upper_targets[stage]. Use
+	 * that so PlanCustomPath gets a tlist derived from the right pathtarget.
+	 */
+	cpath->path.pathtarget = root->upper_targets[UPPERREL_ORDERED];
+	if (cpath->path.pathtarget == NULL)
+		cpath->path.pathtarget = output_rel->reltarget;
+	cpath->path.parallel_aware = false;
+	cpath->path.parallel_safe = false;
+	cpath->path.parallel_workers = 0;
+	cpath->path.rows = limit_n;
+	cpath->path.startup_cost = cheapest->startup_cost;
+
+	/*
+	 * Late-mat avoids materializing payload columns for all but limit_n rows,
+	 * saving O(N_table * (width - sort_cols)) of column decompression and
+	 * projection work.  The standard Sort+Limit path doesn't model that
+	 * AM-internal cost so by the planner's view both paths look similar. Cost
+	 * ours roughly at the input scan's cost reduced by the per-tuple work we
+	 * save outside the top N (one cpu_tuple_cost per non-top-N tuple).
+	 */
+	cpath->path.total_cost = cheapest->total_cost
+		- cpu_tuple_cost * Max(cheapest->rows - limit_n, 0);
+	/* never let the discount go below the startup cost */
+	if (cpath->path.total_cost < cpath->path.startup_cost)
+		cpath->path.total_cost = cpath->path.startup_cost;
+	cpath->path.pathkeys = NIL; /* output is already in sort order */
+	cpath->custom_paths = NIL;
+
+	/*
+	 * Forward the WHERE clauses to exec.  They are evaluated against the
+	 * projected probe slot (sort keys + tid) before pushing into the bounded
+	 * tuplesort, so the LIMIT survives only rows that pass the qual.  The
+	 * corresponding qual-key extraction also lets the AM prune row groups via
+	 * zone maps cheaply.
+	 *
+	 * We stash them in custom_private to bypass setrefs.c, which would try to
+	 * rewrite Var references against the (empty) custom_scan_tlist; the
+	 * late-mat probe slot is shaped from the relation's tupledesc instead.
+	 */
+	baseclauses = NIL;
+	foreach(lc2, input_rel->baserestrictinfo)
+	{
+		RestrictInfo *ri = lfirst_node(RestrictInfo, lc2);
+
+		/*
+		 * SubPlans cannot be compiled in the executor-side
+		 * ExecPrepareQual(parent = NULL); leave such queries to the stock
+		 * plan.
+		 */
+		if (contain_subplans((Node *) ri->clause) ||
+			cs_contains_param((Node *) ri->clause))
+			return;
+
+		baseclauses = lappend(baseclauses, ri->clause);
+	}
+	cpath->custom_private = list_make2(info, baseclauses);
+	cpath->methods = &cs_lm_path_methods;
+	cpath->flags = 0;
+
+	add_path(output_rel, &cpath->path);
+}
+
+static Plan *
+cs_lm_path_to_plan(PlannerInfo *root, RelOptInfo *rel,
+				   struct CustomPath *best_path, List *tlist,
+				   List *clauses, List *custom_plans)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+	CSLatemat  *info = (CSLatemat *) linitial(best_path->custom_private);
+	List	   *baseclauses = (list_length(best_path->custom_private) > 1
+							   ? (List *) lsecond(best_path->custom_private)
+							   : NIL);
+	List	   *attnos = NIL;
+	List	   *colls = NIL;
+	List	   *ops = NIL;
+	List	   *nfs = NIL;
+	List	   *priv;
+	int			i;
+
+	cscan->scan.plan.targetlist = tlist;
+	cscan->scan.plan.qual = NIL;
+	cscan->scan.plan.lefttree = NULL;
+	cscan->scan.plan.righttree = NULL;
+	cscan->scan.plan.parallel_aware = false;
+	cscan->scan.plan.parallel_safe = false;
+	cscan->scan.scanrelid = info->scanrelid;
+
+	cscan->flags = best_path->flags;
+	cscan->custom_plans = NIL;
+	cscan->custom_exprs = NIL;
+	for (i = 0; i < info->n_sort; i++)
+	{
+		attnos = lappend_int(attnos, info->sort_attnos[i]);
+		colls = lappend_oid(colls, info->sort_collations[i]);
+		ops = lappend_oid(ops, info->sort_operators[i]);
+		nfs = lappend_int(nfs, info->sort_nulls_first[i] ? 1 : 0);
+	}
+	priv = list_make4(attnos, colls, ops, nfs);
+	priv = lappend(priv, makeInteger((int) info->limit_n));
+	priv = lappend(priv, baseclauses);
+	cscan->custom_private = priv;
+	cscan->custom_scan_tlist = NIL;
+	cscan->custom_relids = bms_make_singleton(info->scanrelid);
+	cscan->methods = &cs_lm_scan_methods;
+
+	return (Plan *) cscan;
+}
+
+static Node *
+cs_lm_create_state(CustomScan *cscan)
+{
+	CSLatematState *state = palloc0(sizeof(CSLatematState));
+
+	NodeSetTag(state, T_CustomScanState);
+	state->css.methods = &cs_lm_exec_methods;
+	/* Output is a virtual tuple synthesized from sort_slot's values. */
+	state->css.slotOps = &TTSOpsVirtual;
+	return (Node *) state;
+}
+
+static void
+cs_lm_begin(CustomScanState *node, EState *estate, int eflags)
+{
+	CSLatematState *state = (CSLatematState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	List	   *attnos_l = (List *) linitial(cscan->custom_private);
+	List	   *colls_l = (List *) lsecond(cscan->custom_private);
+	List	   *ops_l = (List *) lthird(cscan->custom_private);
+	List	   *nfs_l = (List *) lfourth(cscan->custom_private);
+	int64		limit_n = (int64) intVal(list_nth(cscan->custom_private, 4));
+	List	   *baseclauses = (list_length(cscan->custom_private) > 5
+							   ? (List *) list_nth(cscan->custom_private, 5)
+							   : NIL);
+	Relation	rel = node->ss.ss_currentRelation;
+	int			n_sort = list_length(attnos_l);
+	int			i;
+	TupleDesc	probe_desc;
+	TupleDesc	rel_desc = RelationGetDescr(rel);
+	AttrNumber *attnos;
+	Oid		   *collations;
+	Oid		   *operators;
+	bool	   *nulls_first;
+	AttrNumber *sort_keys;
+	Bitmapset  *needed_cols = NULL;
+	ScanKeyData *qual_keys = NULL;
+	int			nqual_keys = 0;
+
+	state->rel = rel;
+	state->plan_info.n_sort = n_sort;
+	state->plan_info.limit_n = limit_n;
+
+	state->plan_info.sort_attnos = palloc(sizeof(AttrNumber) * n_sort);
+	state->plan_info.sort_collations = palloc(sizeof(Oid) * n_sort);
+	state->plan_info.sort_operators = palloc(sizeof(Oid) * n_sort);
+	state->plan_info.sort_nulls_first = palloc(sizeof(bool) * n_sort);
+
+	attnos = state->plan_info.sort_attnos;
+	collations = state->plan_info.sort_collations;
+	operators = state->plan_info.sort_operators;
+	nulls_first = state->plan_info.sort_nulls_first;
+
+	for (i = 0; i < n_sort; i++)
+	{
+		attnos[i] = (AttrNumber) list_nth_int(attnos_l, i);
+		collations[i] = list_nth_oid(colls_l, i);
+		operators[i] = list_nth_oid(ops_l, i);
+		nulls_first[i] = (list_nth_int(nfs_l, i) != 0);
+	}
+
+	state->scandesc = rel->rd_tableam->scan_begin(rel, estate->es_snapshot,
+												  0, NULL, NULL,
+												  SO_TYPE_SEQSCAN |
+												  SO_ALLOW_STRAT |
+												  SO_ALLOW_SYNC |
+												  SO_ALLOW_PAGEMODE);
+
+	/*
+	 * Build the narrow probe tupledesc: one column per sort key, plus a
+	 * trailing int8 column carrying the row's ItemPointer packed into 64 bits
+	 * (block << 16 | offset).  Encoding the TID as an int8 keeps the probe
+	 * attribute by-value and avoids the tupdesc/slot complications around the
+	 * 6-byte TID datatype.  The probe shape sets the upper bound on per-row
+	 * work for the input loop -- only sort_keys + 8 bytes are paid for every
+	 * input row, regardless of the relation's width.
+	 */
+	probe_desc = CreateTemplateTupleDesc(n_sort + 1);
+	for (i = 0; i < n_sort; i++)
+	{
+		Form_pg_attribute relatt = TupleDescAttr(rel_desc, attnos[i] - 1);
+
+		TupleDescInitEntry(probe_desc, (AttrNumber) (i + 1),
+						   NameStr(relatt->attname),
+						   relatt->atttypid, relatt->atttypmod, 0);
+		TupleDescInitEntryCollation(probe_desc, (AttrNumber) (i + 1),
+									relatt->attcollation);
+	}
+	TupleDescInitEntry(probe_desc, (AttrNumber) (n_sort + 1), "_tid",
+					   INT8OID, -1, 0);
+	state->probe_desc = probe_desc;
+
+	TupleDescFinalize(probe_desc);
+
+	state->probe_slot = MakeSingleTupleTableSlot(probe_desc, &TTSOpsVirtual);
+	state->sort_slot = MakeSingleTupleTableSlot(probe_desc, &TTSOpsMinimalTuple);
+
+	/* Slot for the raw scan output (relation's full tupledesc). */
+	state->scan_slot = MakeSingleTupleTableSlot(rel_desc, &TTSOpsColumnStore);
+
+	/* Sort keys are the first n_sort columns of probe_desc. */
+	sort_keys = palloc(sizeof(AttrNumber) * n_sort);
+	for (i = 0; i < n_sort; i++)
+		sort_keys[i] = (AttrNumber) (i + 1);
+
+	/*
+	 * TUPLESORT_ALLOWBOUNDED tells tuplesort to use an AllocSet tuple context
+	 * instead of a Bump allocator.  Bump can't free individual tuples, but
+	 * bounded sorts free the largest tuple every time the heap exceeds the
+	 * bound.  Without this flag, tuplesort_set_bound still works for the
+	 * bounded heap but free_sort_tuple's pfree on a Bump-allocated chunk
+	 * crashes inside SlabGetChunkSpace.
+	 */
+	state->sortstate = tuplesort_begin_heap(probe_desc, n_sort,
+											sort_keys, operators,
+											collations, nulls_first,
+											work_mem, NULL,
+											TUPLESORT_ALLOWBOUNDED);
+	tuplesort_set_bound(state->sortstate, limit_n);
+	state->emitted = 0;
+	state->populated = false;
+
+	/*
+	 * Forward needed_cols and qual_keys to the AM: - sort_attnos must be
+	 * loaded so we can build the probe tuple. - any column referenced by
+	 * WHERE quals must be loaded so the residual ExprState can evaluate
+	 * against the scan slot.
+	 *
+	 * The full payload columns are NOT marked needed: those are loaded on
+	 * demand at refetch time via table_tuple_fetch_row_version, which runs
+	 * only against the LIMIT survivors.
+	 */
+	for (i = 0; i < n_sort; i++)
+		needed_cols = bms_add_member(needed_cols, attnos[i] - 1);
+
+	if (baseclauses != NIL)
+	{
+		List	   *vars;
+		ListCell   *lc;
+
+		nqual_keys = cs_extract_scan_qual_keys(baseclauses,
+											   cscan->scan.scanrelid,
+											   &qual_keys);
+
+		vars = pull_var_clause((Node *) baseclauses, 0);
+		foreach(lc, vars)
+		{
+			Var		   *v = (Var *) lfirst(lc);
+
+			if (v->varno == cscan->scan.scanrelid && v->varattno > 0)
+				needed_cols = bms_add_member(needed_cols, v->varattno - 1);
+		}
+
+		state->qual_state = ExecPrepareQual(baseclauses, estate);
+	}
+
+	if (needed_cols != NULL)
+	{
+		cs_scan_set_projection(state->scandesc, needed_cols);
+		bms_free(needed_cols);
+	}
+
+	if (nqual_keys > 0)
+	{
+		cs_scan_set_qual_keys(state->scandesc, nqual_keys, qual_keys);
+		pfree(qual_keys);
+	}
+}
+
+static TupleTableSlot *
+cs_lm_exec(CustomScanState *node)
+{
+	CSLatematState *state = (CSLatematState *) node;
+	ExprContext *econtext = node->ss.ps.ps_ExprContext;
+	TupleTableSlot *fetch_slot = node->ss.ss_ScanTupleSlot;
+	int			n_sort = state->plan_info.n_sort;
+	AttrNumber	tid_attno = (AttrNumber) (n_sort + 1);
+
+	/* First call: drain input into the bounded tuplesort. */
+	if (!state->populated)
+	{
+		while (table_scan_getnextslot(state->scandesc,
+									  ForwardScanDirection, state->scan_slot))
+		{
+			int			i;
+
+			/* Apply residual WHERE quals before paying tuplesort overhead. */
+			if (state->qual_state != NULL)
+			{
+				econtext->ecxt_scantuple = state->scan_slot;
+				if (!ExecQual(state->qual_state, econtext))
+					continue;
+			}
+
+			ExecClearTuple(state->probe_slot);
+			for (i = 0; i < n_sort; i++)
+			{
+				bool		isnull;
+				Datum		v = slot_getattr(state->scan_slot,
+											 state->plan_info.sort_attnos[i],
+											 &isnull);
+
+				state->probe_slot->tts_values[i] = v;
+				state->probe_slot->tts_isnull[i] = isnull;
+			}
+			{
+				ItemPointer src = &state->scan_slot->tts_tid;
+				int64		packed = ((int64) ItemPointerGetBlockNumber(src) << 16)
+					| (int64) ItemPointerGetOffsetNumber(src);
+
+				state->probe_slot->tts_values[n_sort] = Int64GetDatum(packed);
+				state->probe_slot->tts_isnull[n_sort] = false;
+			}
+			ExecStoreVirtualTuple(state->probe_slot);
+
+			tuplesort_puttupleslot(state->sortstate, state->probe_slot);
+		}
+		tuplesort_performsort(state->sortstate);
+		state->populated = true;
+	}
+
+	while (state->emitted < state->plan_info.limit_n)
+	{
+		Datum		tid_d;
+		bool		tid_isnull;
+		int64		packed;
+		ItemPointerData tid;
+		Snapshot	snap = node->ss.ps.state->es_snapshot;
+
+		if (!tuplesort_gettupleslot(state->sortstate, true, true,
+									state->sort_slot, NULL))
+			return NULL;
+
+		state->emitted++;
+
+		tid_d = slot_getattr(state->sort_slot, tid_attno, &tid_isnull);
+		if (tid_isnull)
+			continue;
+		packed = DatumGetInt64(tid_d);
+		ItemPointerSet(&tid,
+					   (BlockNumber) (packed >> 16),
+					   (OffsetNumber) (packed & 0xffff));
+
+		/*
+		 * Refetch the full row.  The same snapshot is in effect as during the
+		 * seq scan, so visibility shouldn't change; if the row is gone
+		 * anyway, skip it (we may return < LIMIT rows on heavy concurrent
+		 * vacuum, matching what a Sort+Limit would see).
+		 */
+		ExecClearTuple(fetch_slot);
+		if (!table_tuple_fetch_row_version(state->rel, &tid, snap, fetch_slot))
+			continue;
+
+		econtext->ecxt_scantuple = fetch_slot;
+
+		if (node->ss.ps.ps_ProjInfo != NULL)
+		{
+			TupleTableSlot *out_slot = ExecProject(node->ss.ps.ps_ProjInfo);
+
+			ExecMaterializeSlot(out_slot);
+			return out_slot;
+		}
+		ExecMaterializeSlot(fetch_slot);
+		return fetch_slot;
+	}
+	return NULL;
+}
+
+static void
+cs_lm_end(CustomScanState *node)
+{
+	CSLatematState *state = (CSLatematState *) node;
+
+	if (state->sortstate != NULL)
+	{
+		tuplesort_end(state->sortstate);
+		state->sortstate = NULL;
+	}
+	if (state->probe_slot != NULL)
+	{
+		ExecDropSingleTupleTableSlot(state->probe_slot);
+		state->probe_slot = NULL;
+	}
+	if (state->sort_slot != NULL)
+	{
+		ExecDropSingleTupleTableSlot(state->sort_slot);
+		state->sort_slot = NULL;
+	}
+	if (state->scan_slot != NULL)
+	{
+		ExecDropSingleTupleTableSlot(state->scan_slot);
+		state->scan_slot = NULL;
+	}
+	if (state->scandesc != NULL)
+	{
+		table_endscan(state->scandesc);
+		state->scandesc = NULL;
+	}
+}
+
+static void
+cs_lm_rescan(CustomScanState *node)
+{
+	/* Conservative: re-init state. */
+	cs_lm_end(node);
+	cs_lm_begin(node, node->ss.ps.state, 0);
+}
+
+static void
+cs_lm_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	CSLatematState *state = (CSLatematState *) node;
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	for (int i = 0; i < state->plan_info.n_sort; i++)
+	{
+		if (i > 0)
+			appendStringInfoString(&buf, ", ");
+		appendStringInfo(&buf, "att=%d", state->plan_info.sort_attnos[i]);
+	}
+	ExplainPropertyText("Columnstore LateMat Sort Keys", buf.data, es);
+	ExplainPropertyInteger("Columnstore LateMat Limit", NULL,
+						   state->plan_info.limit_n, es);
+	pfree(buf.data);
 }

@@ -1,5 +1,13 @@
 # Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
+# columnstore's SUM/AVG accumulators rely on a native 128-bit integer type
+# (PG_INT128_TYPE).  Platforms without one -- 32-bit builds, and MSVC, which
+# has no __int128 -- are unsupported: skip the whole extension there so the
+# rest of the build is unaffected.
+if not cdata.has('PG_INT128_TYPE')
+  subdir_done()
+endif
+
 columnstore_sources = files(
   'columnstore.c',
   'cs_compact.c',
@@ -46,6 +54,7 @@ tests += {
       'cs_scan_paths',
       'cs_compaction',
       'cs_pushdown',
+      'cs_agg_pushdown',
       'cs_index',
       'cs_misc',
       'cs_sort_key',
