@@ -75,6 +75,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/selfuncs.h"
 #include "utils/syscache.h"
 
 /*
@@ -172,6 +173,15 @@ static Node *cs_agg_create_state(CustomScan *cscan);
 static void cs_agg_begin(CustomScanState *node, EState *estate, int eflags);
 static TupleTableSlot *cs_agg_exec(CustomScanState *node);
 static void cs_agg_end(CustomScanState *node);
+static void cs_agg_open_scan(CustomScanState *node, EState *estate,
+							 ParallelTableScanDesc pscan);
+static Size cs_agg_estimate_dsm(CustomScanState *node, ParallelContext *pcxt);
+static void cs_agg_initialize_dsm(CustomScanState *node,
+								  ParallelContext *pcxt, void *coordinate);
+static void cs_agg_reinitialize_dsm(CustomScanState *node,
+									ParallelContext *pcxt, void *coordinate);
+static void cs_agg_initialize_worker(CustomScanState *node, shm_toc *toc,
+									 void *coordinate);
 static void cs_agg_rescan(CustomScanState *node);
 static void cs_agg_explain(CustomScanState *node, List *ancestors,
 						   ExplainState *es);
@@ -218,6 +228,10 @@ static const struct CustomExecMethods cs_agg_exec_methods = {
 	.ExecCustomScan = cs_agg_exec,
 	.EndCustomScan = cs_agg_end,
 	.ReScanCustomScan = cs_agg_rescan,
+	.EstimateDSMCustomScan = cs_agg_estimate_dsm,
+	.InitializeDSMCustomScan = cs_agg_initialize_dsm,
+	.ReInitializeDSMCustomScan = cs_agg_reinitialize_dsm,
+	.InitializeWorkerCustomScan = cs_agg_initialize_worker,
 	.ExplainCustomScan = cs_agg_explain,
 };
 
@@ -912,6 +926,11 @@ cs_initialize_dsm_custom_scan(CustomScanState *node, ParallelContext *pcxt,
 
 	/* see cs_estimate_dsm_custom_scan for why the wrapper is required */
 	table_parallelscan_initialize(rel, pscan, estate->es_snapshot);
+
+	/* defensive: never leak a serial scan opened before the DSM phase */
+	if (state->scandesc != NULL)
+		cs_scan_end(state->scandesc);
+
 	cs_open_scan(state, estate, pscan);
 }
 
@@ -931,6 +950,9 @@ cs_initialize_worker_custom_scan(CustomScanState *node, shm_toc *toc,
 {
 	CSCustomScanState *state = (CSCustomScanState *) node;
 	ParallelTableScanDesc pscan = (ParallelTableScanDesc) coordinate;
+
+	if (state->scandesc != NULL)
+		cs_scan_end(state->scandesc);
 
 	cs_open_scan(state, node->ss.ps.state, pscan);
 }
@@ -1900,7 +1922,10 @@ cs_extract_scan_qual_keys(List *quals, Index scanrelid, ScanKeyData **keys_out)
 
 #include "access/htup_details.h"
 #include "catalog/pg_aggregate.h"
+#include "common/int128.h"
 #include "fmgr.h"
+#include "libpq/pqformat.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/numeric.h"
@@ -1984,7 +2009,12 @@ typedef struct CSAggState
 	CSAggOne   *aggs;			/* template per output position */
 	bool		emitted;
 	bool		exhausted;
+	bool		is_partial;		/* emit AGGSPLIT_INITIAL_SERIAL transition
+								 * state */
 	TupleTableSlot *probe_slot; /* slot used to read input rows */
+	Bitmapset  *needed_cols;	/* projection mask applied at scan-open time */
+	ScanKeyData *qual_keys;		/* zone-map qual keys applied at scan-open */
+	int			nqual_keys;
 	ExprState  *qual_state;		/* per-row residual filter, or NULL */
 
 	/* GROUP BY support */
@@ -2024,7 +2054,8 @@ static void cs_agg_ensure_hash_cxts(CSAggState *state, EState *estate);
 static bool cs_aggref_pushdown_kind(Aggref *agg, Relation rel, CSAggOne *out);
 static void cs_agg_accum_row(CSAggOne *a, TableScanDesc scandesc,
 							 TupleTableSlot *slot, ExprContext *econtext);
-static void cs_agg_emit_one(CSAggOne *a, TupleTableSlot *out, int outpos);
+static void cs_agg_emit_one(CSAggOne *a, TupleTableSlot *out, int outpos,
+							bool partial);
 
 /*
  * Convert a (possibly negative) int128 numerator with the given decimal
@@ -2349,7 +2380,8 @@ cs_create_upper_paths_hook(PlannerInfo *root, UpperRelationKind stage,
 		return;
 	}
 
-	if (stage != UPPERREL_GROUP_AGG)
+	if (stage != UPPERREL_GROUP_AGG &&
+		stage != UPPERREL_PARTIAL_GROUP_AGG)
 		return;
 
 	/* GROUPING SETS, ROLLUP, CUBE not supported. */
@@ -2472,9 +2504,9 @@ cs_create_upper_paths_hook(PlannerInfo *root, UpperRelationKind stage,
 
 	/*
 	 * If GROUP BY is present, every key expression must be a simple Var
-	 * referencing the input rel.  We rely on the planner to put one matching
-	 * Var in the target list per group key, which is the case for ordinary
-	 * plain GROUP BY x, y, z queries.
+	 * referencing the input rel, or a Const (e.g. GROUP BY 1 where the
+	 * targetlist position is a constant -- the planner treats this as a
+	 * trivial group key and we just emit it from the targetlist Const).
 	 */
 	if (parse->groupClause != NIL)
 	{
@@ -2483,23 +2515,13 @@ cs_create_upper_paths_hook(PlannerInfo *root, UpperRelationKind stage,
 			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc2);
 			TargetEntry *tle = get_sortgroupclause_tle(sgc, parse->targetList);
 
+			if (IsA(tle->expr, Const))
+				continue;
 			if (!IsA(tle->expr, Var))
 				return;
 			if (((Var *) tle->expr)->varno != input_rel->relid)
 				return;
 		}
-
-		/*
-		 * GROUP BY pushdown is disabled: our TupleHashTable is in-memory and
-		 * can't spill, while the standard HashAgg (PG18+) and GroupAggregate
-		 * paths can.  The planner's estimate of output_rel->rows is
-		 * unreliable for combined keys (e.g. ClickBench Q33's
-		 * WHATCID/CLIENTID combo: planner says ~hundreds of thousands, actual
-		 * is millions -> OOM).  Defer to the memory-bounded standard paths
-		 * for any GROUP BY query; the pushdown still wins big on ungrouped
-		 * aggregates (the most common analytical shape).
-		 */
-		return;
 	}
 
 	if (agg_descs == NIL)
@@ -2551,11 +2573,130 @@ cs_create_upper_paths_hook(PlannerInfo *root, UpperRelationKind stage,
 					  baseclauses,
 					  copyObject(parse->havingQual));
 	priv = lappend(priv, having_aggrefs_extra);
+	priv = lappend(priv, makeInteger(0));	/* not partial */
 	cpath->custom_private = priv;
 	cpath->methods = &cs_agg_path_methods;
 	cpath->flags = 0;
 
-	add_path(output_rel, &cpath->path);
+	/*
+	 * Sequential ColumnstoreAggregate is added on UPPERREL_GROUP_AGG only for
+	 * ungrouped queries.  GROUP BY queries use the partial path on
+	 * UPPERREL_PARTIAL_GROUP_AGG below; this avoids OOM risk under bad
+	 * row-count estimates and lets the planner pick a parallel-aware Finalize
+	 * Aggregate above us.
+	 */
+	if (stage == UPPERREL_GROUP_AGG && parse->groupClause == NIL)
+		add_path(output_rel, &cpath->path);
+
+	/*
+	 * Partial-aware ColumnstoreAggregate on UPPERREL_PARTIAL_GROUP_AGG. Each
+	 * worker accumulates its own grouphash; the upstream Finalize Aggregate
+	 * that gather_grouping_paths will install on top of Gather combines
+	 * partial states.  Bail for COUNT_DISTINCT (per-group dedup hash can't
+	 * combine across workers) and for the numeric INTERNAL- state aggs
+	 * (SUM_NUMERIC, AVG_NUMERIC) which need a NumericVar serializer that
+	 * lives static in numeric.c.  AVG_INT and SUM_INT8 also use INTERNAL
+	 * transition state, but their bytea format (int8_avg_serialize: N + sumX
+	 * as 24 bytes) is trivial enough that cs_agg_emit_one can produce it
+	 * directly.  HAVING is also unsupported here: the Finalize step lives
+	 * upstream and can't see our partial- state Aggrefs.
+	 */
+	if (stage == UPPERREL_PARTIAL_GROUP_AGG && parse->groupClause != NIL)
+	{
+		ListCell   *adlc;
+		bool		partial_safe = true;
+		Relation	rel_open;
+		int			parallel_workers;
+
+		if (parse->havingQual != NULL || having_aggrefs_extra != NIL)
+			partial_safe = false;
+		foreach(adlc, agg_descs)
+		{
+			CSAggOne   *desc = (CSAggOne *) lfirst(adlc);
+
+			if (desc == NULL)
+				continue;
+			switch (desc->kind)
+			{
+				case CS_AGG_COUNT:
+				case CS_AGG_SUM_INT:
+				case CS_AGG_SUM_INT8:
+				case CS_AGG_AVG_INT:
+				case CS_AGG_MIN:
+				case CS_AGG_MAX:
+				case CS_AGG_GROUP_KEY:
+				case CS_AGG_PASSTHROUGH:
+					break;
+				default:
+					partial_safe = false;
+					break;
+			}
+		}
+		if (!partial_safe)
+			return;
+
+		rel_open = relation_open(rte->relid, NoLock);
+		parallel_workers = cs_compute_parallel_workers(rel_open);
+		relation_close(rel_open, NoLock);
+		if (parallel_workers <= 0)
+			return;
+
+		{
+			CustomPath *ppath = makeNode(CustomPath);
+			List	   *ppriv;
+			List	   *group_exprs = NIL;
+			ListCell   *gc;
+			double		est_groups;
+			double		divisor = (double) parallel_workers;
+
+			foreach(gc, parse->groupClause)
+			{
+				SortGroupClause *sgc = lfirst_node(SortGroupClause, gc);
+				TargetEntry *tle = get_sortgroupclause_tle(sgc, parse->targetList);
+
+				group_exprs = lappend(group_exprs, tle->expr);
+			}
+			est_groups = estimate_num_groups(root, group_exprs,
+											 input_rel->rows, NULL, NULL);
+
+			/*
+			 * Bail when the grouping keys barely compress.  Each worker still
+			 * has to emit one row per distinct key it sees, and with high
+			 * cardinality the per-worker output is close to the total
+			 * distinct count, so we just shovel the same data through Gather
+			 * and the leader's Finalize HashAggregate spills heavily.  The
+			 * stock plan (single HashAgg over our scan) wins in that regime.
+			 */
+			if (est_groups > input_rel->rows / (divisor * 2.0))
+				return;
+
+			ppath->path.pathtype = T_CustomScan;
+			ppath->path.parent = output_rel;
+			ppath->path.pathtarget = output_rel->reltarget;
+			ppath->path.param_info = NULL;
+			ppath->path.parallel_aware = true;
+			ppath->path.parallel_safe = true;
+			ppath->path.parallel_workers = parallel_workers;
+			ppath->path.rows = clamp_row_est(est_groups / divisor);
+			ppath->path.startup_cost = cheapest->total_cost / divisor;
+			ppath->path.total_cost = cheapest->total_cost / divisor +
+				cpu_tuple_cost * cheapest->rows / divisor * 0.1;
+			ppath->path.pathkeys = NIL;
+			ppath->custom_paths = NIL;
+
+			ppriv = list_make4(agg_descs,
+							   makeInteger(input_rel->relid),
+							   baseclauses,
+							   copyObject(parse->havingQual));
+			ppriv = lappend(ppriv, having_aggrefs_extra);
+			ppriv = lappend(ppriv, makeInteger(1)); /* partial */
+			ppath->custom_private = ppriv;
+			ppath->methods = &cs_agg_path_methods;
+			ppath->flags = 0;
+
+			add_partial_path(output_rel, &ppath->path);
+		}
+	}
 }
 
 /*
@@ -2575,6 +2716,9 @@ cs_agg_path_to_plan(PlannerInfo *root, RelOptInfo *rel,
 	List	   *having_extra = (list_length(best_path->custom_private) > 4
 								? (List *) list_nth(best_path->custom_private, 4)
 								: NIL);
+	bool		is_partial = (list_length(best_path->custom_private) > 5
+							  && intVal(list_nth(best_path->custom_private,
+												 5)) != 0);
 	List	   *augmented_tlist = list_copy(tlist);
 	int			next_resno = list_length(tlist) + 1;
 	ListCell   *lc;
@@ -2615,8 +2759,8 @@ cs_agg_path_to_plan(PlannerInfo *root, RelOptInfo *rel,
 		cscan->scan.plan.qual = NIL;
 	cscan->scan.plan.lefttree = NULL;
 	cscan->scan.plan.righttree = NULL;
-	cscan->scan.plan.parallel_aware = false;
-	cscan->scan.plan.parallel_safe = false;
+	cscan->scan.plan.parallel_aware = is_partial;
+	cscan->scan.plan.parallel_safe = is_partial;
 	cscan->scan.scanrelid = scanrelid;
 
 	cscan->flags = best_path->flags;
@@ -2624,13 +2768,21 @@ cs_agg_path_to_plan(PlannerInfo *root, RelOptInfo *rel,
 	cscan->custom_exprs = NIL;
 
 	/*
-	 * custom_private carries: - linitial: the agg descriptors - lsecond:
-	 * base-rel restriction clauses (Vars retain their input-rel varnos;
-	 * setrefs.c does not process custom_private, so we evaluate them
-	 * ourselves at execution time with ecxt_scantuple=probe_slot).
+	 * custom_private carries Node-only values so the executor's plan
+	 * serializer (ExecSerializePlan, used for parallel workers) can copy /
+	 * round-trip it via nodeToString: - linitial: base-rel restriction
+	 * clauses (Vars retain their input-rel varnos; setrefs.c does not process
+	 * custom_private, so we evaluate them ourselves at execution time with
+	 * ecxt_scantuple=probe_slot). - lsecond:  is_partial flag (Integer 0 or
+	 * 1) so cs_agg_begin knows whether to emit AGGSPLIT_INITIAL_SERIAL
+	 * transition values rather than final values.
+	 *
+	 * The agg descriptors (CSAggOne, not Nodes) are NOT stored here;
+	 * cs_agg_begin rebuilds them by walking the Aggref / Var / Const entries
+	 * in cscan->custom_scan_tlist.
 	 */
-	cscan->custom_private = list_make2(linitial(best_path->custom_private),
-									   lthird(best_path->custom_private));
+	cscan->custom_private = list_make2(lthird(best_path->custom_private),
+									   makeInteger(is_partial ? 1 : 0));
 	cscan->custom_scan_tlist = (List *) copyObject(augmented_tlist);
 	cscan->custom_relids = bms_make_singleton(scanrelid);
 	cscan->methods = &cs_agg_scan_methods;
@@ -2684,10 +2836,10 @@ cs_agg_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	CSAggState *state = (CSAggState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
-	List	   *agg_descs = (List *) linitial(cscan->custom_private);
-	List	   *baseclauses = (list_length(cscan->custom_private) > 1
-							   ? (List *) lsecond(cscan->custom_private)
+	List	   *baseclauses = (list_length(cscan->custom_private) > 0
+							   ? (List *) linitial(cscan->custom_private)
 							   : NIL);
+	List	   *agg_descs = NIL;
 	Relation	rel = node->ss.ss_currentRelation;
 	Bitmapset  *needed_cols = NULL;
 	ScanKeyData *qual_keys = NULL;
@@ -2697,12 +2849,55 @@ cs_agg_begin(CustomScanState *node, EState *estate, int eflags)
 
 	Assert(rel != NULL);
 
-	state->scandesc = rel->rd_tableam->scan_begin(rel, estate->es_snapshot,
-												  0, NULL, NULL,
-												  SO_TYPE_SEQSCAN |
-												  SO_ALLOW_STRAT |
-												  SO_ALLOW_SYNC |
-												  SO_ALLOW_PAGEMODE);
+	/*
+	 * Defer scan_begin to cs_agg_open_scan; for parallel-aware paths the DSM
+	 * init / worker init callbacks open the scan with a shared
+	 * ParallelTableScanDesc, and we don't want to allocate-then-discard a
+	 * sequential scandesc here.
+	 */
+	state->scandesc = NULL;
+	state->is_partial = (list_length(cscan->custom_private) > 1
+						 && intVal(list_nth(cscan->custom_private, 1)) != 0);
+
+	/*
+	 * Rebuild the per-output-position CSAggOne descriptors by walking
+	 * cscan->custom_scan_tlist.  We don't stash the agg_descs list in
+	 * custom_private because CSAggOne is not a Node and would not survive the
+	 * parallel-plan serializer (ExecSerializePlan).  The Aggref nodes in
+	 * custom_scan_tlist round-trip through nodeToString correctly, so we
+	 * re-derive descriptors from them here at begin time.
+	 */
+	foreach(lc, cscan->custom_scan_tlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		CSAggOne	desc = {0};
+		CSAggOne   *copy;
+
+		if (IsA(tle->expr, Const))
+		{
+			agg_descs = lappend(agg_descs, NULL);
+			continue;
+		}
+		if (IsA(tle->expr, Var))
+		{
+			Var		   *v = (Var *) tle->expr;
+
+			copy = palloc0(sizeof(CSAggOne));
+			copy->kind = CS_AGG_GROUP_KEY;
+			copy->col_attno = v->varattno;
+			copy->col_type = v->vartype;
+			agg_descs = lappend(agg_descs, copy);
+			continue;
+		}
+		if (!IsA(tle->expr, Aggref))
+			elog(ERROR, "ColumnstoreAggregate: unexpected tlist node tag %d",
+				 nodeTag(tle->expr));
+		if (!cs_aggref_pushdown_kind((Aggref *) tle->expr, rel, &desc))
+			elog(ERROR, "ColumnstoreAggregate: Aggref no longer pushdownable");
+		copy = palloc(sizeof(CSAggOne));
+		*copy = desc;
+		agg_descs = lappend(agg_descs, copy);
+	}
 
 	state->nagg = list_length(agg_descs);
 	state->aggs = palloc0(sizeof(CSAggOne) * state->nagg);
@@ -2848,17 +3043,9 @@ cs_agg_begin(CustomScanState *node, EState *estate, int eflags)
 		state->qual_state = ExecPrepareQual(baseclauses, estate);
 	}
 
-	if (needed_cols != NULL)
-	{
-		cs_scan_set_projection(state->scandesc, needed_cols);
-		bms_free(needed_cols);
-	}
-
-	if (nqual_keys > 0)
-	{
-		cs_scan_set_qual_keys(state->scandesc, nqual_keys, qual_keys);
-		pfree(qual_keys);
-	}
+	state->needed_cols = needed_cols;
+	state->qual_keys = qual_keys;
+	state->nqual_keys = nqual_keys;
 
 	state->probe_slot = MakeSingleTupleTableSlot(RelationGetDescr(rel),
 												 &TTSOpsColumnStore);
@@ -2963,6 +3150,78 @@ cs_agg_begin(CustomScanState *node, EState *estate, int eflags)
 											   false);
 		state->grp_iter_started = false;
 	}
+
+	/*
+	 * Open the scan now for non-parallel execution.  For parallel-aware paths
+	 * the leader's InitializeDSMCustomScan and each worker's
+	 * InitializeWorkerCustomScan call cs_agg_open_scan with a shared
+	 * ParallelTableScanDesc.
+	 */
+	if (!(node->ss.ps.state->es_use_parallel_mode &&
+		  node->ss.ps.plan->parallel_aware))
+		cs_agg_open_scan(node, estate, NULL);
+}
+
+static void
+cs_agg_open_scan(CustomScanState *node, EState *estate,
+				 ParallelTableScanDesc pscan)
+{
+	CSAggState *state = (CSAggState *) node;
+	Relation	rel = node->ss.ss_currentRelation;
+
+	/* No user flags; see the comment in cs_open_scan(). */
+	if (pscan != NULL)
+		state->scandesc = table_beginscan_parallel(rel, pscan, SO_NONE);
+	else
+		state->scandesc = table_beginscan(rel, estate->es_snapshot,
+										  0, NULL, SO_NONE);
+	state->css.ss.ss_currentScanDesc = state->scandesc;
+	if (state->needed_cols != NULL)
+		cs_scan_set_projection(state->scandesc, state->needed_cols);
+	if (state->nqual_keys > 0)
+		cs_scan_set_qual_keys(state->scandesc,
+							  state->nqual_keys, state->qual_keys);
+}
+
+static Size
+cs_agg_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+{
+	Relation	rel = node->ss.ss_currentRelation;
+	EState	   *estate = node->ss.ps.state;
+
+	/* see cs_estimate_dsm_custom_scan for why the wrapper is required */
+	return table_parallelscan_estimate(rel, estate->es_snapshot);
+}
+
+static void
+cs_agg_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+					  void *coordinate)
+{
+	Relation	rel = node->ss.ss_currentRelation;
+	ParallelTableScanDesc pscan = (ParallelTableScanDesc) coordinate;
+	EState	   *estate = node->ss.ps.state;
+
+	/* see cs_estimate_dsm_custom_scan for why the wrapper is required */
+	table_parallelscan_initialize(rel, pscan, estate->es_snapshot);
+	cs_agg_open_scan(node, estate, pscan);
+}
+
+static void
+cs_agg_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+						void *coordinate)
+{
+	Relation	rel = node->ss.ss_currentRelation;
+	ParallelTableScanDesc pscan = (ParallelTableScanDesc) coordinate;
+
+	table_parallelscan_reinitialize(rel, pscan);
+}
+
+static void
+cs_agg_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
+{
+	ParallelTableScanDesc pscan = (ParallelTableScanDesc) coordinate;
+
+	cs_agg_open_scan(node, node->ss.ps.state, pscan);
 }
 
 /*
@@ -3196,7 +3455,14 @@ cs_agg_accum_row(CSAggOne *a, TableScanDesc scan, TupleTableSlot *slot,
 				}
 				a->sumX += (int128) ival;
 				a->saw_value = true;
-				if (a->kind == CS_AGG_AVG_INT)
+
+				/*
+				 * count is the partial-aggregate N: it must be tracked for
+				 * AVG (we divide by it in the final emit) and for SUM_INT8
+				 * (the upstream numeric_poly_sum / int8_avg_combine relies on
+				 * N > 0 to distinguish "no rows" from "all-NULL rows").
+				 */
+				if (a->kind == CS_AGG_AVG_INT || a->kind == CS_AGG_SUM_INT8)
 					a->count++;
 			}
 			break;
@@ -3233,9 +3499,51 @@ cs_agg_accum_row(CSAggOne *a, TableScanDesc scan, TupleTableSlot *slot,
 	}
 }
 
-/* Materialize one CSAggOne's finalized output value into a slot position. */
+/*
+ * Build the bytea that PG's int8_avg_serialize would have produced for an
+ * Int128AggState with the given N and sumX.  This is the partial transition
+ * value expected by the deserialize/combine functions of SUM(int8) and
+ * AVG(int8): both aggregates declare aggtranstype = INTERNAL with
+ * aggserialfn = int8_avg_serialize, so producing this bytea directly lets a
+ * Finalize Aggregate above us complete the aggregation.
+ */
+static bytea *
+cs_int128_aggstate_serialize(int64 N, int128 sumX)
+{
+	StringInfoData buf;
+
+	pq_begintypsend(&buf);
+	pq_sendint64(&buf, N);
+	pq_sendint64(&buf, PG_INT128_HI_INT64(sumX));
+	pq_sendint64(&buf, (int64) PG_INT128_LO_UINT64(sumX));
+	return pq_endtypsend(&buf);
+}
+
+/*
+ * Build a 2-element bigint[] {count, sum} that matches Int8TransTypeData,
+ * the partial transition value expected by AVG(int2)/AVG(int4) (aggtranstype
+ * = bigint[], no aggserialfn).  Their aggcombinefn = int4_avg_combine reads
+ * the array and validates ARR_SIZE strictly, so we emit the canonical 1-D
+ * non-null INT8OID array shape.
+ */
+static ArrayType *
+cs_int8_transtype_array(int64 count, int64 sum)
+{
+	Datum		elems[2];
+
+	elems[0] = Int64GetDatum(count);
+	elems[1] = Int64GetDatum(sum);
+	return construct_array_builtin(elems, 2, INT8OID);
+}
+
+/*
+ * Materialize one CSAggOne's output value into a slot position.  When
+ * partial=true and the kind is INTERNAL-stated (CS_AGG_AVG_INT,
+ * CS_AGG_SUM_INT8), emit the serialized partial transition state (bytea)
+ * for an upstream Finalize Aggregate.  Otherwise emit the final value.
+ */
 static void
-cs_agg_emit_one(CSAggOne *a, TupleTableSlot *out, int outpos)
+cs_agg_emit_one(CSAggOne *a, TupleTableSlot *out, int outpos, bool partial)
 {
 	switch (a->kind)
 	{
@@ -3323,7 +3631,21 @@ cs_agg_emit_one(CSAggOne *a, TupleTableSlot *out, int outpos)
 				out->tts_isnull[outpos] = true;
 			break;
 		case CS_AGG_SUM_INT8:
-			if (a->saw_value)
+			if (partial)
+			{
+				/*
+				 * SUM(int8): aggtransfn=int8_avg_accum (Int128AggState),
+				 * aggserialfn=int8_avg_serialize.  Even when we never saw a
+				 * value, partial output must still match the serialized empty
+				 * state so combine + finalfn produce NULL upstream.
+				 */
+				bytea	   *b = cs_int128_aggstate_serialize(a->saw_value ? a->count : 0,
+															 a->saw_value ? a->sumX : (int128) 0);
+
+				out->tts_values[outpos] = PointerGetDatum(b);
+				out->tts_isnull[outpos] = false;
+			}
+			else if (a->saw_value)
 			{
 				out->tts_values[outpos] = NumericGetDatum(
 														  cs_int128_to_numeric(a->sumX, 0));
@@ -3333,7 +3655,35 @@ cs_agg_emit_one(CSAggOne *a, TupleTableSlot *out, int outpos)
 				out->tts_isnull[outpos] = true;
 			break;
 		case CS_AGG_AVG_INT:
-			if (a->saw_value && a->count > 0)
+			if (partial)
+			{
+				int64		N = a->saw_value ? a->count : 0;
+				int128		sumX = a->saw_value ? a->sumX : (int128) 0;
+
+				/*
+				 * AVG output type differs by input type: AVG(int8):
+				 * aggtranstype = INTERNAL (Int128AggState) with aggserialfn =
+				 * int8_avg_serialize -> bytea. AVG(int2|int4): aggtranstype =
+				 * bigint[] (Int8TransTypeData packed as a 2-element int8
+				 * array, count + sum), no serialize step.  The upstream
+				 * int4_avg_combine validates ARR_SIZE strictly, so we must
+				 * emit the canonical 1-D non-null array shape.
+				 */
+				if (a->col_type == INT8OID)
+				{
+					bytea	   *b = cs_int128_aggstate_serialize(N, sumX);
+
+					out->tts_values[outpos] = PointerGetDatum(b);
+				}
+				else
+				{
+					ArrayType  *arr = cs_int8_transtype_array(N, (int64) sumX);
+
+					out->tts_values[outpos] = PointerGetDatum(arr);
+				}
+				out->tts_isnull[outpos] = false;
+			}
+			else if (a->saw_value && a->count > 0)
 			{
 				Numeric		sum = cs_int128_to_numeric(a->sumX, 0);
 				Datum		count_d = DirectFunctionCall1(int8_numeric,
@@ -3531,7 +3881,8 @@ cs_agg_exec(CustomScanState *node)
 				}
 				else
 				{
-					cs_agg_emit_one(&gstate->aggs[i], scan_slot, i);
+					cs_agg_emit_one(&gstate->aggs[i], scan_slot, i,
+									state->is_partial);
 				}
 			}
 			ExecStoreVirtualTuple(scan_slot);
@@ -3614,7 +3965,7 @@ cs_agg_exec(CustomScanState *node)
 			scan_slot->tts_isnull[i] = true;
 			continue;
 		}
-		cs_agg_emit_one(a, scan_slot, i);
+		cs_agg_emit_one(a, scan_slot, i, state->is_partial);
 	}
 	ExecStoreVirtualTuple(scan_slot);
 
@@ -4161,7 +4512,6 @@ cs_lm_begin(CustomScanState *node, EState *estate, int eflags)
 		cs_scan_set_projection(state->scandesc, needed_cols);
 		bms_free(needed_cols);
 	}
-
 	if (nqual_keys > 0)
 	{
 		cs_scan_set_qual_keys(state->scandesc, nqual_keys, qual_keys);

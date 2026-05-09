@@ -81,6 +81,7 @@ tests += {
       't/001_concurrent_inserts.pl',
       't/002_wal_consistency.pl',
       't/003_two_phase.pl',
+      't/004_scale.pl',
     ],
   },
 }

@@ -288,3 +288,37 @@ INSERT INTO cs_agg_allnull SELECT NULL FROM generate_series(1, 500);
 VACUUM cs_agg_allnull;
 SELECT count(*), count(v), sum(v), avg(v) FROM cs_agg_allnull;
 DROP TABLE cs_agg_null, cs_agg_allnull;
+
+-- Parallel-aware partial ColumnstoreAggregate.  A grouped aggregate over a
+-- table with more than one row group, with the parallel cost knobs forced
+-- on, plans a "Parallel Custom Scan (ColumnstoreAggregate)" under a
+-- Gather that the Finalize aggregate combines.  Each worker (or the leader,
+-- if no worker launches) runs the grouped emit path, which deforms the
+-- per-group hash tuples through grp_slot's descriptor -- the descriptor
+-- must be TupleDescFinalize()d or that deform asserts/misreads.  The serial
+-- grouped query uses a plain HashAggregate, so this path is reachable only
+-- under parallelism.
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+CREATE TABLE cs_agg_par (g int, i4 int, i8 bigint, n numeric) USING columnstore;
+INSERT INTO cs_agg_par
+    SELECT i % 5, i, i::bigint * 1000, (i % 50) * 0.5
+    FROM generate_series(1, 120000) i;
+VACUUM cs_agg_par;
+EXPLAIN (COSTS OFF)
+    SELECT g, count(*), sum(i4), sum(i8), avg(i4), min(i4), max(i4)
+        FROM cs_agg_par GROUP BY g;
+-- Pushed-down integer aggregates combined across workers; values are
+-- deterministic regardless of how many workers actually launch.
+SELECT g, count(*), sum(i4), sum(i8), avg(i4), min(i4), max(i4)
+    FROM cs_agg_par GROUP BY g ORDER BY g;
+-- SUM/AVG(numeric) are deliberately not partial-pushed; the query still
+-- runs correctly under the same parallel knobs (via the stock aggregate).
+SELECT g, sum(n), avg(n) FROM cs_agg_par GROUP BY g ORDER BY g;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+DROP TABLE cs_agg_par;
