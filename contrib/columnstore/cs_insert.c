@@ -99,6 +99,17 @@ cs_delta_page_insert(Relation rel, Buffer buf, HeapTuple tuple,
 	tupsize = MAXALIGN(tuple->t_len);
 	page = BufferGetPage(buf);
 
+	/*
+	 * The caller located this page through an unlocked metapage read, so it
+	 * may be stale.  Refuse pages a running compaction has fenced (it has
+	 * already collected their contents and will consume them without seeing a
+	 * tuple added now), and anything that is not a delta page at all
+	 * (concurrent extension can interleave column data pages into the nominal
+	 * delta range).  The caller extends instead.
+	 */
+	if (!CSPageIsDelta(page) || CSDeltaPageIsFenced(page))
+		return false;
+
 	if (PageGetFreeSpace(page) < tupsize + sizeof(ItemIdData))
 		return false;
 
@@ -198,7 +209,8 @@ cs_delta_do_insert(Relation rel, TupleTableSlot *slot, HeapTuple tuple)
 
 	/*
 	 * Try to insert into the last delta page only.  Earlier pages are already
-	 * full, so scanning backwards wastes buffer locks.
+	 * full (or fenced by a running compaction), so scanning backwards wastes
+	 * buffer locks.
 	 */
 	if (meta.cs_delta_nblocks > 0)
 	{
@@ -426,8 +438,24 @@ cs_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 
 		cur_buf = ReadBuffer(rel, last_blk);
 		LockBuffer(cur_buf, BUFFER_LOCK_EXCLUSIVE);
-		xlog_state = GenericXLogStart(rel);
-		cur_page = GenericXLogRegisterBuffer(xlog_state, cur_buf, 0);
+
+		/*
+		 * Our metapage view is unlocked and may be stale: the page may be
+		 * fenced by a running compaction (about to be consumed; adding tuples
+		 * would lose them) or not be a delta page at all.  Fall through to
+		 * extending in that case.  See cs_delta_page_insert.
+		 */
+		if (CSPageIsDelta(BufferGetPage(cur_buf)) &&
+			!CSDeltaPageIsFenced(BufferGetPage(cur_buf)))
+		{
+			xlog_state = GenericXLogStart(rel);
+			cur_page = GenericXLogRegisterBuffer(xlog_state, cur_buf, 0);
+		}
+		else
+		{
+			UnlockReleaseBuffer(cur_buf);
+			cur_buf = InvalidBuffer;
+		}
 	}
 
 	for (int i = 0; i < nslots; i++)

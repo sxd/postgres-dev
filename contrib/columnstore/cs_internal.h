@@ -25,6 +25,121 @@
 #include "storage/bufpage.h"
 #include "utils/rel.h"
 
+
+/*
+ * Alignment-safe equivalents of fetch_att()/store_att_byval() for the
+ * byte-packed columnar format.
+ *
+ * Column values in that format are not stored at type-aligned offsets -- a
+ * 4-byte value may immediately follow a 1-byte type tag, for example -- so
+ * the typed pointer dereferences in the core macros (e.g. *(int32 *) p) are
+ * undefined behavior here.  Mainstream hardware (x86 and ARM alike) tolerates
+ * the unaligned access, so this is latent in ordinary builds, but it is a
+ * hard trap under -fsanitize=alignment.  These helpers go through memcpy,
+ * which is well-defined for any alignment and lowers to the same instruction
+ * the macros would emit on unaligned-tolerant targets.  Byte layout and sign
+ * handling are otherwise identical to the core macros, so the on-disk format
+ * is unchanged.
+ */
+static inline Datum
+cs_fetch_att(const void *T, bool attbyval, int attlen)
+{
+	int16		v16;
+	int32		v32;
+	int64		v64;
+
+	if (!attbyval)
+		return PointerGetDatum(T);
+
+	switch (attlen)
+	{
+		case sizeof(char):
+			return CharGetDatum(*((const char *) T));
+		case sizeof(int16):
+			memcpy(&v16, T, sizeof(v16));
+			return Int16GetDatum(v16);
+		case sizeof(int32):
+			memcpy(&v32, T, sizeof(v32));
+			return Int32GetDatum(v32);
+		case sizeof(int64):
+			memcpy(&v64, T, sizeof(v64));
+			return Int64GetDatum(v64);
+		default:
+			elog(ERROR, "unsupported byval length: %d", attlen);
+			return 0;
+	}
+}
+
+static inline void
+cs_store_att_byval(void *T, Datum newdatum, int attlen)
+{
+	int16		v16;
+	int32		v32;
+	int64		v64;
+
+	switch (attlen)
+	{
+		case sizeof(char):
+			*((char *) T) = DatumGetChar(newdatum);
+			break;
+		case sizeof(int16):
+			v16 = DatumGetInt16(newdatum);
+			memcpy(T, &v16, sizeof(v16));
+			break;
+		case sizeof(int32):
+			v32 = DatumGetInt32(newdatum);
+			memcpy(T, &v32, sizeof(v32));
+			break;
+		case sizeof(int64):
+			v64 = DatumGetInt64(newdatum);
+			memcpy(T, &v64, sizeof(v64));
+			break;
+		default:
+			elog(ERROR, "unsupported byval length: %d", attlen);
+	}
+}
+
+/*
+ * Alignment-safe scalar accessors for values stored at non-type-aligned
+ * offsets in the byte-packed columnar buffers -- a uint16/uint32 dictionary
+ * index array, or an int64 value array that follows a 1- or 2-byte header,
+ * for example.  As with cs_fetch_att()/cs_store_att_byval() above, the memcpy
+ * is well-defined for any alignment and lowers to a single load/store on
+ * unaligned-tolerant targets.
+ */
+static inline uint16
+cs_read_u16(const void *p)
+{
+	uint16		v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+static inline uint32
+cs_read_u32(const void *p)
+{
+	uint32		v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+static inline int64
+cs_read_i64(const void *p)
+{
+	int64		v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+static inline void
+cs_write_u16(void *p, uint16 v)
+{
+	memcpy(p, &v, sizeof(v));
+}
+
 /*
  * Per-relation options for columnstore tables.
  *
@@ -256,6 +371,7 @@ typedef struct CSZoneMap
 	Datum		zm_min;			/* by-value: the value; by-ref: reconstructed */
 	Datum		zm_max;
 	bool		zm_has_minmax;	/* false if all NULLs or unsupported type */
+	bool		zm_all_null;	/* every row in this chunk is NULL */
 	uint8		zm_mode;		/* CS_ZM_BYVAL / CS_ZM_EXACT / CS_ZM_PREFIX /
 								 * CS_ZM_SORTKEY */
 	uint16		zm_min_len;		/* stored varlena length (0 for BYVAL) */
@@ -284,14 +400,23 @@ typedef struct CSRowGroupDesc
 	/* CSZoneMap entries follow after the column descs */
 } CSRowGroupDesc;
 
+/*
+ * Byte offset of the CSZoneMap array within a row group descriptor.  The
+ * zone maps follow the variable-length rg_columns[] array, but CSZoneMap
+ * contains Datum members and so needs MAXALIGN; MAXALIGN the offset (the
+ * descriptor itself is always allocated MAXALIGN'd) so the entries are
+ * properly aligned regardless of natts and of sizeof(CSColumnChunkDesc).
+ */
+#define CSRowGroupZoneMapsOffset(natts)	\
+	MAXALIGN(offsetof(CSRowGroupDesc, rg_columns) + \
+			 (natts) * sizeof(CSColumnChunkDesc))
+
 #define CSRowGroupDescSize(natts)	\
-	(offsetof(CSRowGroupDesc, rg_columns) + \
-	 (natts) * sizeof(CSColumnChunkDesc) + \
-	 (natts) * sizeof(CSZoneMap))
+	(CSRowGroupZoneMapsOffset(natts) + (natts) * sizeof(CSZoneMap))
 
 /* Access zone maps from a row group desc */
 #define CSRowGroupGetZoneMaps(rg)	\
-	((CSZoneMap *) ((char *)(rg)->rg_columns + (rg)->rg_natts * sizeof(CSColumnChunkDesc)))
+	((CSZoneMap *) ((char *) (rg) + CSRowGroupZoneMapsOffset((rg)->rg_natts)))
 
 /*
  * Metapage data, stored in the special space of page 0.
@@ -401,6 +526,28 @@ typedef struct CSDictColumn
  */
 typedef struct CSColumnCache
 {
+	/*
+	 * All decompressed data and pointer arrays for this cache are allocated
+	 * in cc_cxt when it is set.  Callers reached through the raw table-AM
+	 * interface (ALTER TABLE rewrites, CREATE INDEX, ANALYZE) invoke the lazy
+	 * loaders from short-lived per-row contexts that are reset between rows;
+	 * without a dedicated context the cache would dangle.  A NULL cc_cxt
+	 * means the owner manages lifetimes itself (single-row fetch uses and
+	 * frees the cache immediately).
+	 */
+	MemoryContext cc_cxt;
+
+	/*
+	 * Descriptor describing the STORED format of the rows being decoded.
+	 * Normally identical to RelationGetDescr(), which the loaders fall back
+	 * to when this is NULL.  During an ALTER TABLE rewrite the relcache
+	 * already shows the new column types while the data being scanned is
+	 * still in the old format; ATRewriteTable's scan slot carries the old
+	 * descriptor, and the slot callbacks store it here so the decoders use
+	 * the correct attlen/attbyval.
+	 */
+	TupleDesc	cc_tupdesc;
+
 	Datum	  **col_values;		/* [col][row] -- NULL for direct-access cols */
 	bool	  **col_nulls;		/* [col][row] */
 	bool	   *col_loaded;		/* per-column loaded flag */
@@ -580,7 +727,6 @@ typedef struct CSIndexFetchData
 	bool		tombstones_collected;	/* lazy init flag */
 } CSIndexFetchData;
 
-
 /*
  * Custom TupleTableSlot for columnstore with lazy column decompression.
  *
@@ -689,10 +835,6 @@ extern void cs_scan_rescan(TableScanDesc scan, ScanKeyData *key,
 						   bool allow_sync, bool allow_pagemode);
 extern void cs_scan_set_projection(TableScanDesc scan,
 								   Bitmapset *needed_cols);
-extern void cs_scan_set_qual_keys(TableScanDesc scan, int nkeys,
-								  ScanKeyData *keys);
-extern void cs_scan_set_bloom_filter(TableScanDesc scan, AttrNumber attno,
-									 struct bloom_filter *filter);
 extern bool cs_scan_column_encoding(TableScanDesc scan, AttrNumber attno,
 									Oid *phys_type, int32 *dscale);
 extern bool cs_scan_get_raw_attr(TableScanDesc scan, TupleTableSlot *slot,
@@ -715,17 +857,11 @@ extern Datum cs_column_point_read(CSColumnCache *cache, Relation rel,
 								  int col, uint32 row, bool *isnull);
 extern Datum cs_int64_to_numeric_buf(int64 val, int dscale, char *buf);
 extern void cs_column_cache_free(CSColumnCache *cache, int natts);
-extern void cs_collect_tombstones(CScanDesc scan);
-extern bool cs_tombstone_lookup(ItemPointerData *tids, int count,
-								ItemPointer target);
 
 /* cs_vacuum.c */
 extern double columnstore_rowgroup_compaction_threshold;
 extern void cs_vacuum_rel(Relation rel, const VacuumParams *params,
 						  BufferAccessStrategy bstrategy);
-
-/* cs_customscan.c */
-extern void cs_register_custom_scan_methods(void);
 
 /* columnstore.c (cost-model helpers used by CustomPath) */
 extern void cs_relation_cost_factors(Relation rel,
@@ -740,8 +876,9 @@ extern const char *cs_get_sort_key(Relation rel);
 
 /* cs_compact.c */
 extern void cs_compact_delta(Relation rel);
+extern void cs_freeze_delta(Relation rel, TransactionId horizon);
 extern void cs_compact_rowgroups(Relation rel);
-extern void cs_materialize_tombstones(Relation rel);
+extern void cs_materialize_tombstones(Relation rel, TransactionId horizon);
 extern BlockNumber cs_write_one_rowgroup(Relation rel, TupleDesc tupdesc,
 										 int natts,
 										 Datum **col_values, bool **col_nulls,

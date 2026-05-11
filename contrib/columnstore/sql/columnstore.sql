@@ -68,6 +68,42 @@ SELECT * FROM cs_copy ORDER BY a;
 
 DROP TABLE cs_copy;
 
+-- Delta-to-columnar freeze via VACUUM
+CREATE TABLE cs_basic (a int, b text) USING columnstore;
+INSERT INTO cs_basic SELECT i, 'row-' || i FROM generate_series(1, 20) i;
+SELECT count(*) AS delta_count FROM cs_basic;
+VACUUM cs_basic;
+SELECT count(*) AS columnar_count FROM cs_basic;
+SELECT a, b FROM cs_basic WHERE a <= 5 ORDER BY a;
+SELECT a, b FROM cs_basic WHERE a = 20;
+
+-- Mixed delta + columnar scan
+INSERT INTO cs_basic SELECT i, 'new-' || i FROM generate_series(100, 105) i;
+SELECT count(*) AS mixed_count FROM cs_basic;
+SELECT a, b FROM cs_basic WHERE a >= 100 ORDER BY a;
+
+-- Multiple row groups
+DROP TABLE cs_basic;
+CREATE TABLE cs_basic (a int, b text) USING columnstore;
+INSERT INTO cs_basic SELECT i, 'batch1-' || i FROM generate_series(1, 100) i;
+VACUUM cs_basic;
+INSERT INTO cs_basic SELECT i, 'batch2-' || i FROM generate_series(200, 250) i;
+VACUUM cs_basic;
+SELECT count(*) AS multi_rg_count FROM cs_basic;
+SELECT a, b FROM cs_basic WHERE a = 1;
+SELECT a, b FROM cs_basic WHERE a = 200;
+
+-- Compression: highly-compressible data round-trips correctly
+DROP TABLE cs_basic;
+CREATE TABLE cs_basic (a int, b text) USING columnstore;
+INSERT INTO cs_basic SELECT i, repeat('hello world ', 10) FROM generate_series(1, 1000) i;
+VACUUM cs_basic;
+SELECT count(*) AS compressed_count FROM cs_basic;
+SELECT a, length(b) AS blen FROM cs_basic WHERE a = 500;
+SELECT left(b, 11) AS b_prefix FROM cs_basic WHERE a = 42;
+
+DROP TABLE cs_basic;
+
 -- Zero-column tables: a zero-attribute data tuple must not be mistaken
 -- for a tombstone (tombstones are zero-attribute tuples distinguished by
 -- their columnar-space t_ctid)

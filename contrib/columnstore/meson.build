@@ -2,11 +2,13 @@
 
 columnstore_sources = files(
   'columnstore.c',
+  'cs_compact.c',
   'cs_insert.c',
   'cs_reloptions.c',
   'cs_scan.c',
   'cs_slot.c',
   'cs_storage.c',
+  'cs_vacuum.c',
 )
 
 if host_system == 'windows'
@@ -35,6 +37,21 @@ tests += {
   'regress': {
     'sql': [
       'columnstore',
+      'cs_compaction',
+      'cs_delta_columnar',
+      'cs_dictionary',
+      'cs_encoding',
+    ],
+  },
+  'isolation': {
+    'specs': [
+      'cs_vacuum_inflight',
+    ],
+  },
+  'tap': {
+    'tests': [
+      't/001_concurrent_inserts.pl',
+      't/002_wal_consistency.pl',
     ],
   },
 }

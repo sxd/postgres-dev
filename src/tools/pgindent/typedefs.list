@@ -396,6 +396,7 @@ CRSSnapshotAction
 CSColumnCache
 CSColumnChunkDesc
 CSDeltaPageOpaque
+CSDeltaTupleClass
 CSDictColumn
 CSFreeRange
 CSIndexFetchData
@@ -405,6 +406,7 @@ CSParallelScanDescData
 CSRGCacheEntry
 CSRdOptions
 CSRowGroupDesc
+CSSortContext
 CSTupleTableSlot
 CSZoneMap
 CScanDesc

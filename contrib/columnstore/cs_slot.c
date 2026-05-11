@@ -79,16 +79,284 @@ tts_columnstore_clear(TupleTableSlot *slot)
 }
 
 /*
- * Attribute materialization callback.
+ * Lazy column decompression callback.
  *
- * All rows live in the delta heap in this commit, so every attribute was
- * filled eagerly when the tuple was stored; just mark them valid.  Columnar
- * rows get lazy per-column decompression here in a later commit.
+ * For columnar rows, decompress columns on demand up to the requested natts.
+ * For delta rows (or non-scan contexts), all attrs are already valid.
  */
 static void
 tts_columnstore_getsomeattrs(TupleTableSlot *slot, int natts)
 {
-	slot->tts_nvalid = slot->tts_tupleDescriptor->natts;
+	CSTupleTableSlot *csslot = (CSTupleTableSlot *) slot;
+	CSColumnCache *cache;
+	CScanDesc	scan;
+	Relation	rel;
+	MemoryContext oldcxt;
+	int			col;
+
+	/*
+	 * Callers must not ask for more attributes than the slot's descriptor has
+	 * (the column-cache arrays below are sized to the relation's attribute
+	 * count).
+	 */
+	Assert(natts <= slot->tts_tupleDescriptor->natts);
+
+	if (!csslot->cs_is_columnar || csslot->cs_colcache == NULL)
+	{
+		/*
+		 * Delta row or non-scan use: all attrs were filled eagerly. Just mark
+		 * them all valid.
+		 */
+		slot->tts_nvalid = slot->tts_tupleDescriptor->natts;
+		return;
+	}
+
+	/*
+	 * Columnar row: decompress columns lazily.
+	 *
+	 * For seq/bitmap scans, cs_scan provides the Relation and projection
+	 * info.  For index scans, cs_scan is NULL and cs_rel provides the
+	 * Relation for on-demand column decompression.
+	 *
+	 * Switch to the slot's memory context for column buffer allocations since
+	 * getsomeattrs may be called from the per-tuple context.
+	 */
+	cache = csslot->cs_colcache;
+
+	/*
+	 * Record the descriptor the executor handed us as the authoritative
+	 * stored format for the decoders: during an ALTER TABLE rewrite it is the
+	 * OLD descriptor, while RelationGetDescr() already shows the new column
+	 * types (see CSColumnCache.cc_tupdesc).
+	 */
+	cache->cc_tupdesc = slot->tts_tupleDescriptor;
+	scan = csslot->cs_scan;
+
+	if (scan != NULL)
+		rel = scan->rs_base.rs_rd;
+	else
+		rel = csslot->cs_rel;
+	oldcxt = MemoryContextSwitchTo(slot->tts_mcxt);
+
+	if (scan != NULL && scan->needed_col_list != NULL)
+	{
+		/*
+		 * Fast path with projection pushdown.
+		 *
+		 * Iterate only the pre-computed needed column list -- O(needed) per
+		 * row instead of O(natts).  Unneeded columns were pre-set to NULL at
+		 * the start of each row group by cs_columnar_getnext and persist
+		 * across rows since ExecClearTuple does not zero
+		 * tts_values/tts_isnull.
+		 */
+		for (int i = 0; i < scan->needed_col_count; i++)
+		{
+			col = scan->needed_col_list[i];
+			if (col >= natts)
+				break;
+
+			/*
+			 * Point-read optimization: for FOR/NI64 columns that haven't been
+			 * fully decoded yet, extract just the needed value instead of
+			 * decoding the entire column (100K values).  This is a large win
+			 * when few rows match a selective filter but many columns must be
+			 * materialized (e.g. SELECT * ... LIMIT).
+			 */
+			if (!cache->col_loaded[col])
+			{
+				CSColumnChunkDesc *chk = &cache->cur_rg_desc->rg_columns[col];
+				uint8		comp = chk->cc_compression;
+
+				if ((CS_PREENC(comp) == CS_PREENC_FOR ||
+					 CS_PREENC(comp) == CS_PREENC_NI64 ||
+					 CS_PREENC(comp) == CS_PREENC_NI64_FOR) &&
+					cache->col_point_reads[col] < CS_POINT_READ_THRESHOLD)
+				{
+					cs_base_decompress_column(cache, rel, col);
+					slot->tts_values[col] =
+						cs_column_point_read(cache, rel, col,
+											 csslot->cs_row,
+											 &slot->tts_isnull[col]);
+					cache->col_point_reads[col]++;
+					continue;
+				}
+			}
+
+			cs_ensure_column_loaded(cache, rel, col);
+
+			if (cache->col_dict && cache->col_dict[col] != NULL)
+			{
+				/* Dictionary-encoded column */
+				CSDictColumn *dict = cache->col_dict[col];
+				uint32		idx;
+
+				switch (dict->index_width)
+				{
+					case 1:
+						idx = ((uint8 *) dict->index_data)[csslot->cs_row];
+						break;
+					case 2:
+						idx = cs_read_u16((const char *) dict->index_data + (Size) (csslot->cs_row) * sizeof(uint16));
+						break;
+					default:
+						idx = cs_read_u32((const char *) dict->index_data + (Size) (csslot->cs_row) * sizeof(uint32));
+						break;
+				}
+
+				if (dict->has_null && idx == dict->dict_count)
+				{
+					slot->tts_isnull[col] = true;
+					slot->tts_values[col] = (Datum) 0;
+				}
+				else
+				{
+					slot->tts_isnull[col] = false;
+					slot->tts_values[col] = dict->dict_values[idx];
+				}
+			}
+			else if (cache->col_values[col] != NULL)
+			{
+				slot->tts_values[col] = cache->col_values[col][csslot->cs_row];
+				slot->tts_isnull[col] = cache->col_nulls[col][csslot->cs_row];
+			}
+			else
+			{
+				CompactAttribute *att = TupleDescCompactAttr(slot->tts_tupleDescriptor, col);
+
+				if (cache->col_null_bitmap[col] != NULL)
+				{
+					if (CS_ISNULL(cache->col_null_bitmap[col], csslot->cs_row))
+					{
+						slot->tts_isnull[col] = true;
+						slot->tts_values[col] = (Datum) 0;
+						continue;
+					}
+				}
+
+				slot->tts_isnull[col] = false;
+				if (cache->col_ni64_buf[col] != NULL)
+				{
+					int64		ival = ((int64 *) cache->col_raw_data[col])[csslot->cs_row];
+
+					slot->tts_values[col] =
+						cs_int64_to_numeric_buf(ival,
+												(int) cache->col_ni64_dscale[col],
+												cache->col_ni64_buf[col]);
+				}
+				else
+				{
+					slot->tts_values[col] =
+						cs_fetch_att(cache->col_raw_data[col] +
+									 (Size) csslot->cs_row * att->attlen,
+									 true, att->attlen);
+				}
+			}
+		}
+	}
+	else
+	{
+		/*
+		 * Standard path without projection: load all columns in the requested
+		 * range sequentially.
+		 */
+		for (col = slot->tts_nvalid; col < natts; col++)
+		{
+			/* Point-read optimization (see fast path above) */
+			if (!cache->col_loaded[col])
+			{
+				CSColumnChunkDesc *chk = &cache->cur_rg_desc->rg_columns[col];
+				uint8		comp = chk->cc_compression;
+
+				if ((CS_PREENC(comp) == CS_PREENC_FOR ||
+					 CS_PREENC(comp) == CS_PREENC_NI64 ||
+					 CS_PREENC(comp) == CS_PREENC_NI64_FOR) &&
+					cache->col_point_reads[col] < CS_POINT_READ_THRESHOLD)
+				{
+					cs_base_decompress_column(cache, rel, col);
+					slot->tts_values[col] =
+						cs_column_point_read(cache, rel, col,
+											 csslot->cs_row,
+											 &slot->tts_isnull[col]);
+					cache->col_point_reads[col]++;
+					continue;
+				}
+			}
+
+			cs_ensure_column_loaded(cache, rel, col);
+
+			if (cache->col_dict && cache->col_dict[col] != NULL)
+			{
+				/* Dictionary-encoded column */
+				CSDictColumn *dict = cache->col_dict[col];
+				uint32		idx;
+
+				switch (dict->index_width)
+				{
+					case 1:
+						idx = ((uint8 *) dict->index_data)[csslot->cs_row];
+						break;
+					case 2:
+						idx = cs_read_u16((const char *) dict->index_data + (Size) (csslot->cs_row) * sizeof(uint16));
+						break;
+					default:
+						idx = cs_read_u32((const char *) dict->index_data + (Size) (csslot->cs_row) * sizeof(uint32));
+						break;
+				}
+
+				if (dict->has_null && idx == dict->dict_count)
+				{
+					slot->tts_isnull[col] = true;
+					slot->tts_values[col] = (Datum) 0;
+				}
+				else
+				{
+					slot->tts_isnull[col] = false;
+					slot->tts_values[col] = dict->dict_values[idx];
+				}
+			}
+			else if (cache->col_values[col] != NULL)
+			{
+				slot->tts_values[col] = cache->col_values[col][csslot->cs_row];
+				slot->tts_isnull[col] = cache->col_nulls[col][csslot->cs_row];
+			}
+			else
+			{
+				CompactAttribute *att = TupleDescCompactAttr(slot->tts_tupleDescriptor, col);
+
+				if (cache->col_null_bitmap[col] != NULL)
+				{
+					if (CS_ISNULL(cache->col_null_bitmap[col], csslot->cs_row))
+					{
+						slot->tts_isnull[col] = true;
+						slot->tts_values[col] = (Datum) 0;
+						continue;
+					}
+				}
+
+				slot->tts_isnull[col] = false;
+				if (cache->col_ni64_buf[col] != NULL)
+				{
+					int64		ival = ((int64 *) cache->col_raw_data[col])[csslot->cs_row];
+
+					slot->tts_values[col] =
+						cs_int64_to_numeric_buf(ival,
+												(int) cache->col_ni64_dscale[col],
+												cache->col_ni64_buf[col]);
+				}
+				else
+				{
+					slot->tts_values[col] =
+						cs_fetch_att(cache->col_raw_data[col] +
+									 (Size) csslot->cs_row * att->attlen,
+									 true, att->attlen);
+				}
+			}
+		}
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+
+	slot->tts_nvalid = natts;
 }
 
 static Datum
