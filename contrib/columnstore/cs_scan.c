@@ -26,6 +26,7 @@
 #include "nodes/bitmapset.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/procarray.h"
 #include "utils/array.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -270,6 +271,9 @@ static void cs_preload_qual_columns(CScanDesc scan, CSColumnCache *cache,
 									Relation rel);
 static void cs_build_selection_bitmap(CScanDesc scan, CSColumnCache *cache,
 									  Relation rel);
+static bool cs_parallel_getnextslot(TableScanDesc sscan,
+									ScanDirection direction,
+									TupleTableSlot *slot);
 
 
 /*
@@ -428,8 +432,36 @@ cs_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKeyData *key,
 	scan->cur_row_in_group = 0;
 
 	/* Read metapage to get layout info */
-	if (RelationGetNumberOfBlocks(rel) > 0)
+	if (pscan != NULL)
 	{
+		/*
+		 * Parallel scan: copy metadata from the shared descriptor that was
+		 * initialized by cs_parallelscan_initialize.  Start with both phases
+		 * "done" -- work units drive the scan via cs_parallel_getnextslot.
+		 */
+		CSParallelScanDesc cpscan = (CSParallelScanDesc) pscan;
+
+		scan->delta_start = cpscan->pcs_delta_start;
+		scan->delta_nblocks = cpscan->pcs_delta_nblocks;
+		scan->nrowgroups = cpscan->pcs_nrowgroups;
+		scan->natts = cpscan->pcs_natts;
+
+		/*
+		 * Read the row group directory from the coordinates captured in the
+		 * shared descriptor (not the live metapage, which a concurrent VACUUM
+		 * may have advanced past what the leader saw).
+		 */
+		scan->rg_catalog_blocks = cs_read_rgdir_at(rel,
+												   cpscan->pcs_rgdir_start,
+												   cpscan->pcs_rgdir_npages,
+												   cpscan->pcs_nrowgroups);
+
+		scan->delta_done = true;
+		scan->columnar_done = true;
+	}
+	else if (RelationGetNumberOfBlocks(rel) > 0)
+	{
+		/* Non-parallel scan: read metapage directly */
 		CSMetaPageData meta;
 
 		cs_read_metapage(rel, &meta);
@@ -671,6 +703,40 @@ cs_scan_rescan(TableScanDesc sscan, ScanKeyData *key,
 
 	scan->sel_bitmap_valid = false;
 
+	/* Reset tombstones so they're re-collected with potentially new snapshot */
+	if (scan->tombstone_tids)
+	{
+		pfree(scan->tombstone_tids);
+		scan->tombstone_tids = NULL;
+	}
+	scan->tombstone_count = 0;
+	scan->tombstones_collected = false;
+
+	/* Restart TABLESAMPLE and bitmap-scan state */
+	scan->sample_inited = false;
+	scan->bm_started = false;
+	scan->bm_noffsets = 0;
+	scan->bm_curoff = 0;
+
+	/*
+	 * Under a parallel scan, work units are handed out through the shared
+	 * claim counter (reset by ReInitializeDSM); marking the local state
+	 * "done" here makes this participant claim its first unit instead of
+	 * re-emitting the whole table alongside the workers.
+	 */
+	if (sscan->rs_parallel != NULL)
+	{
+		scan->delta_done = true;
+		scan->columnar_done = true;
+	}
+
+	/*
+	 * Restart instrumentation: EXPLAIN ANALYZE totals would otherwise
+	 * accumulate across rescans while the per-loop row counts do not.
+	 */
+	scan->instr_rg_examined = 0;
+	scan->instr_rg_zonemap_skipped = 0;
+
 	if (key)
 		sscan->rs_key = key;
 }
@@ -761,6 +827,45 @@ cs_scan_set_qual_keys(TableScanDesc sscan, int nkeys, ScanKeyData *keys)
 }
 
 /*
+ * Collect tombstones visible to the current snapshot.
+ *
+ * Stub for step 4: columnar DELETE arrives in step 5, so there are no
+ * tombstones to collect yet.  The real walk-the-delta-pages implementation
+ * replaces this body in step 5.
+ */
+void
+cs_collect_tombstones(CScanDesc scan)
+{
+	scan->tombstones_collected = true;
+	scan->tombstone_count = 0;
+	scan->tombstone_tids = NULL;
+}
+
+/*
+ * Binary search for a virtual TID in a sorted tombstone array.
+ */
+bool
+cs_tombstone_lookup(ItemPointerData *tids, int count, ItemPointer target)
+{
+	int			lo = 0;
+	int			hi = count - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+		int			cmp = ItemPointerCompare(&tids[mid], target);
+
+		if (cmp == 0)
+			return true;
+		else if (cmp < 0)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
+	return false;
+}
+
+/*
  * Initialize the comparison function cache for zone map evaluation.
  *
  * For each scan key, look up the btree comparison function for the
@@ -769,6 +874,13 @@ cs_scan_set_qual_keys(TableScanDesc sscan, int nkeys, ScanKeyData *keys)
 static void
 cs_zonemap_init_cmp_cache(CScanDesc scan)
 {
+	/*
+	 * Index builds must index rows with pending or committed deletes too:
+	 * older snapshots may still see them, and the fetch path hides what a
+	 * given snapshot must not.  Applying tombstones here -- worse, under
+	 * SnapshotAny, where even an aborted delete reads as one -- would leave
+	 * those rows out of the index for good.
+	 */
 	Relation	rel = scan->rs_base.rs_rd;
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	int			nkeys = scan->cs_nkeys;
@@ -2443,7 +2555,26 @@ cs_delta_getnext(CScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
 				if (CS_IS_TOMBSTONE(tuple.t_data))
 					continue;
 
-				if (!cs_delta_satisfies_visibility(&tuple, snapshot))
+				if (scan->rs_index_build)
+				{
+					/*
+					 * Index everything except inserts known to have aborted:
+					 * rows deleted-but-visible-to-someone and in-progress
+					 * inserts must all be reachable through the index;
+					 * per-snapshot filtering happens at fetch. Check
+					 * in-progress before committed (see xact.c).
+					 */
+					TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple.t_data);
+
+					if (tuple.t_data->t_infomask & HEAP_XMIN_INVALID)
+						continue;
+					if (!(tuple.t_data->t_infomask & HEAP_XMIN_COMMITTED) &&
+						!TransactionIdIsCurrentTransactionId(xmin) &&
+						!TransactionIdIsInProgress(xmin) &&
+						!TransactionIdDidCommit(xmin))
+						continue;	/* aborted insert */
+				}
+				else if (!cs_delta_satisfies_visibility(&tuple, snapshot))
 					continue;
 
 				scan->delta_visible_offsets[scan->delta_nvisible++] = off;
@@ -4234,6 +4365,82 @@ cs_columnar_getnext(CScanDesc scan, TupleTableSlot *slot)
 }
 
 /*
+ * Parallel scan: get the next tuple by claiming work units atomically.
+ *
+ * Work unit 0 = delta store, units 1..N = row groups 0..N-1.
+ * When a worker exhausts its current unit, it atomically claims the next.
+ */
+static bool
+cs_parallel_getnextslot(TableScanDesc sscan, ScanDirection direction,
+						TupleTableSlot *slot)
+{
+	CScanDesc	scan = (CScanDesc) sscan;
+	CSParallelScanDesc cpscan = (CSParallelScanDesc) sscan->rs_parallel;
+	uint64		total_units = 1 + (uint64) cpscan->pcs_nrowgroups;
+	uint64		unit;
+	uint32		rg;
+
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		/* Try to return a tuple from the current work unit */
+		if (!scan->delta_done)
+		{
+			if (cs_delta_getnext(scan, direction, slot))
+				return true;
+			scan->delta_done = true;
+		}
+
+		if (!scan->columnar_done)
+		{
+			bool		got;
+
+			/* Collect tombstones lazily before the first columnar row access */
+			if (!scan->tombstones_collected)
+				cs_collect_tombstones(scan);
+
+			if (scan->count_optimized)
+				got = cs_columnar_getnext_countonly(scan, slot);
+			else
+				got = cs_columnar_getnext(scan, slot);
+
+			if (got)
+				return true;
+			scan->columnar_done = true;
+		}
+
+		/* Current work unit exhausted -- claim the next one */
+		unit = pg_atomic_fetch_add_u64(&cpscan->pcs_nallocated, 1);
+
+		if (unit >= total_units)
+			return false;		/* no more work */
+
+		if (unit == 0)
+		{
+			/* Work unit 0: delta store */
+			scan->delta_done = false;
+			scan->delta_cur_block = scan->delta_start;
+			scan->delta_cur_offset = InvalidOffsetNumber;
+			scan->delta_nvisible = 0;
+			scan->delta_visible_idx = 0;
+		}
+		else
+		{
+			/* Work unit N: row group N-1 */
+			rg = (uint32) (unit - 1);
+
+			scan->columnar_done = false;
+			scan->cur_rowgroup = rg;
+			scan->nrowgroups = rg + 1;	/* bracket exactly one RG */
+			scan->cur_row_in_group = 0;
+			scan->colcache.col_nrows = 0;
+			scan->rg_desc_preloaded = false;
+		}
+	}
+}
+
+/*
  * Get the next tuple from the scan (delta first, then columnar).
  */
 bool
@@ -4244,10 +4451,9 @@ cs_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 
 	CHECK_FOR_INTERRUPTS();
 
+	/* Parallel scan: dispatch to the parallel work-unit driver */
 	if (sscan->rs_parallel != NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("columnstore: parallel scans not yet supported")));
+		return cs_parallel_getnextslot(sscan, direction, slot);
 
 	/*
 	 * Both cs_delta_getnext and cs_columnar_getnext clear the slot before
@@ -4260,6 +4466,10 @@ cs_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 		if (cs_delta_getnext(scan, direction, slot))
 			return true;
 	}
+
+	/* Collect tombstones lazily before the first columnar row access */
+	if (!scan->tombstones_collected)
+		cs_collect_tombstones(scan);
 
 	/* Second: scan columnar row groups */
 	if (!scan->columnar_done)

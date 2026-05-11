@@ -17,10 +17,11 @@ DATA = columnstore--1.0.sql
 PGFILEDESC = "columnstore - columnar storage table access method"
 
 REGRESS = columnstore cs_compaction cs_delta_columnar cs_dictionary cs_encoding \
-	cs_pushdown cs_scan_paths cs_zonemap
+	cs_index cs_misc cs_pushdown cs_scan_paths cs_zonemap
 
 ISOLATION = \
-	cs_vacuum_inflight
+	cs_vacuum_inflight \
+	cs_index_vacuum_window
 
 TAP_TESTS = 1
 

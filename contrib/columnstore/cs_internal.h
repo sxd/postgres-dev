@@ -644,6 +644,8 @@ typedef struct CScanDescData
 	bool		bm_recheck;		/* current page requires recheck */
 
 	/* TABLESAMPLE state */
+	bool		rs_index_build; /* CREATE INDEX scan: see
+								 * cs_index_build_range_scan */
 	bool		sample_inited;	/* true after first sample call */
 	BlockNumber sample_nblocks; /* total virtual blocks */
 	BlockNumber sample_cur_block;	/* current virtual block */
@@ -688,8 +690,24 @@ typedef struct CSParallelScanDescData
 	int16		pcs_natts;
 	BlockNumber pcs_delta_start;
 	BlockNumber pcs_delta_nblocks;
+
+	/*
+	 * Location of the row group directory.  The directory contents are
+	 * deliberately NOT copied into shared memory: the struct must be
+	 * fixed-size, because table_parallelscan_estimate and
+	 * table_parallelscan_initialize read the metapage at different times and
+	 * a VACUUM committing new row groups in between would make a flexible
+	 * array overrun the DSM allocation.  Workers read the directory pages
+	 * themselves from these captured coordinates, which is safe because a
+	 * published directory is never modified in place: compaction writes a
+	 * replacement and frees the old pages, and freed pages are only reused
+	 * under AccessExclusiveLock (see cs_freelist_alloc), which cannot be
+	 * taken while this scan runs.
+	 */
+	BlockNumber pcs_rgdir_start;
+	uint32		pcs_rgdir_npages;
+
 	pg_atomic_uint64 pcs_nallocated;	/* next work unit to hand out */
-	BlockNumber pcs_rg_catalog_blocks[FLEXIBLE_ARRAY_MEMBER];
 } CSParallelScanDescData;
 
 typedef CSParallelScanDescData *CSParallelScanDesc;
@@ -712,6 +730,9 @@ typedef struct CSRGCacheEntry
 typedef struct CSIndexFetchData
 {
 	IndexFetchTableData base;	/* must be first */
+	MemoryContext rg_cache_parent;	/* parent for per-entry cache contexts;
+									 * captured at fetch-begin so entry caches
+									 * outlive per-row contexts */
 	Buffer		delta_buf;		/* buffer for delta page lookups */
 	bool		meta_initialized;	/* true after first columnar lookup */
 	int			natts;			/* relation natts (cached) */
@@ -792,6 +813,8 @@ extern void cs_delbitmap_set_bit(Relation rel, BlockNumber start_block,
 								 uint32 row_offset);
 extern bool cs_delbitmap_test_bit(Relation rel, BlockNumber start_block,
 								  uint32 row_offset);
+extern BlockNumber *cs_read_rgdir_at(Relation rel, BlockNumber rgdir_start,
+									 uint32 rgdir_npages, uint32 nrowgroups);
 extern CSFreeRange *cs_read_freelist(Relation rel, CSMetaPageData *meta);
 extern void cs_write_freelist(Relation rel, CSMetaPageData *meta,
 							  CSFreeRange *ranges, uint32 nranges);
@@ -861,6 +884,9 @@ extern Datum cs_column_point_read(CSColumnCache *cache, Relation rel,
 								  int col, uint32 row, bool *isnull);
 extern Datum cs_int64_to_numeric_buf(int64 val, int dscale, char *buf);
 extern void cs_column_cache_free(CSColumnCache *cache, int natts);
+extern void cs_collect_tombstones(CScanDesc scan);
+extern bool cs_tombstone_lookup(ItemPointerData *tids, int count,
+								ItemPointer target);
 
 /* cs_vacuum.c */
 extern double columnstore_rowgroup_compaction_threshold;

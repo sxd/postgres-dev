@@ -41,6 +41,8 @@ tests += {
       'cs_delta_columnar',
       'cs_dictionary',
       'cs_encoding',
+      'cs_index',
+      'cs_misc',
       'cs_pushdown',
       'cs_scan_paths',
       'cs_zonemap',
@@ -49,6 +51,7 @@ tests += {
   'isolation': {
     'specs': [
       'cs_vacuum_inflight',
+      'cs_index_vacuum_window',
     ],
   },
   'tap': {

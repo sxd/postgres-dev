@@ -502,19 +502,27 @@ cs_write_column_data(Relation rel, BlockNumber *start_block_inout,
 BlockNumber *
 cs_read_rgdir(Relation rel, CSMetaPageData *meta)
 {
-	BlockNumber *dir;
-	uint32		nrowgroups = meta->cs_nrowgroups;
+	return cs_read_rgdir_at(rel, meta->cs_rgdir_start,
+							meta->cs_rgdir_npages, meta->cs_nrowgroups);
+}
+
+/*
+ * As cs_read_rgdir, but from explicit directory coordinates (used by
+ * parallel workers, which get them from the shared scan descriptor
+ * rather than the live metapage).
+ */
+BlockNumber *
+cs_read_rgdir_at(Relation rel, BlockNumber rgdir_start, uint32 rgdir_npages,
+				 uint32 nrowgroups)
+{
 	uint32		data_len;
-	char	   *raw;
 
 	if (nrowgroups == 0)
 		return NULL;
 
 	data_len = sizeof(BlockNumber) * nrowgroups;
-	raw = cs_read_column_pages(rel, meta->cs_rgdir_start,
-							   meta->cs_rgdir_npages, data_len);
-	dir = (BlockNumber *) raw;
-	return dir;
+	return (BlockNumber *) cs_read_column_pages(rel, rgdir_start,
+												rgdir_npages, data_len);
 }
 
 /*
