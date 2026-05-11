@@ -22,6 +22,18 @@ VACUUM cs_toast_stress;
 SELECT id, length(big_text) AS tlen, md5(big_text) AS thash, small_val
     FROM cs_toast_stress WHERE id IN (1, 10, 20) ORDER BY id;
 
+-- Delete some and compact
+DELETE FROM cs_toast_stress WHERE id <= 15;
+SET columnstore.rowgroup_compaction_threshold = 0.5;
+VACUUM cs_toast_stress;
+RESET columnstore.rowgroup_compaction_threshold;
+
+-- Verify data survived compaction
+SELECT count(*) AS after_compact FROM cs_toast_stress;
+SELECT id, length(big_text) AS tlen, small_val
+    FROM cs_toast_stress WHERE id = 16;
+
+DROP TABLE cs_toast_stress;
 
 -- ===================================================================
 -- Parallel scan correctness
@@ -135,6 +147,16 @@ SELECT c1, c100, c200 FROM cs_wide_stress WHERE c1 = 200;
 -- Column projection: access only 3 of 200 columns
 SELECT sum(c1), sum(c100), sum(c200) FROM cs_wide_stress;
 
+-- Delete and compact
+DELETE FROM cs_wide_stress WHERE c1 <= 150;
+SET columnstore.rowgroup_compaction_threshold = 0.5;
+VACUUM cs_wide_stress;
+RESET columnstore.rowgroup_compaction_threshold;
+
+SELECT count(*) AS after_compact FROM cs_wide_stress;
+SELECT c1, c100, c200 FROM cs_wide_stress WHERE c1 = 151;
+
+DROP TABLE cs_wide_stress;
 
 -- ===================================================================
 -- Numeric precision edge cases through full pipeline

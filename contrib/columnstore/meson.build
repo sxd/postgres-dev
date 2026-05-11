@@ -38,6 +38,7 @@ tests += {
     'sql': [
       'columnstore',
       'cs_compaction',
+      'cs_delete_update',
       'cs_delta_columnar',
       'cs_dictionary',
       'cs_encoding',
@@ -52,12 +53,22 @@ tests += {
     'specs': [
       'cs_vacuum_inflight',
       'cs_index_vacuum_window',
+      'cs_delete_visibility',
+      'cs_select_for_update',
+      'cs_vacuum_concurrent',
+      'cs_vacuum_snapshot',
+      'cs_on_conflict_rr',
+      'cs_index_visibility',
+      'cs_unique_dirty',
+      'cs_lock_for_update',
+      'cs_fk_locking',
     ],
   },
   'tap': {
     'tests': [
       't/001_concurrent_inserts.pl',
       't/002_wal_consistency.pl',
+      't/003_two_phase.pl',
     ],
   },
 }

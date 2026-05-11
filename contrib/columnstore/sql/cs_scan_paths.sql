@@ -27,6 +27,43 @@ SELECT * FROM cs_proj WHERE c1 = 999;
 DROP TABLE cs_proj;
 
 -- ===================================================================
+-- Point reads via index scan on FOR-encoded columns
+-- ===================================================================
+CREATE TABLE cs_point_for (id int, v int, padding text) USING columnstore;
+INSERT INTO cs_point_for SELECT i, 1000 + (i % 100), 'pad_' || i
+    FROM generate_series(1, 2000) i;
+VACUUM cs_point_for;
+CREATE INDEX ON cs_point_for (id);
+ANALYZE cs_point_for;
+
+SET enable_seqscan = off;
+-- Single point read
+SELECT id, v FROM cs_point_for WHERE id = 42;
+SELECT id, v FROM cs_point_for WHERE id = 1999;
+-- Range that stays within point-read threshold
+SELECT count(*) FROM cs_point_for WHERE id BETWEEN 1 AND 50;
+RESET enable_seqscan;
+DROP TABLE cs_point_for;
+
+-- ===================================================================
+-- Point reads on NI64-encoded columns
+-- ===================================================================
+CREATE TABLE cs_point_ni64 (id int, v numeric(10,2)) USING columnstore;
+INSERT INTO cs_point_ni64 SELECT i, (i * 1.23)::numeric(10,2)
+    FROM generate_series(1, 2000) i;
+VACUUM cs_point_ni64;
+CREATE INDEX ON cs_point_ni64 (id);
+ANALYZE cs_point_ni64;
+
+SET enable_seqscan = off;
+SELECT id, v FROM cs_point_ni64 WHERE id = 100;
+SELECT id, v FROM cs_point_ni64 WHERE id = 1500;
+-- Verify aggregate on index-scanned subset
+SELECT sum(v) FROM cs_point_ni64 WHERE id BETWEEN 1 AND 10;
+RESET enable_seqscan;
+DROP TABLE cs_point_ni64;
+
+-- ===================================================================
 -- Sequential scan with filter on various encodings
 -- ===================================================================
 CREATE TABLE cs_scan_filter (
@@ -65,6 +102,10 @@ CREATE TABLE cs_cnt (id int) USING columnstore;
 INSERT INTO cs_cnt SELECT i FROM generate_series(1, 2000) i;
 VACUUM cs_cnt;
 SELECT count(*) AS pure FROM cs_cnt;
+
+-- After deletion
+DELETE FROM cs_cnt WHERE id % 10 = 0;
+SELECT count(*) AS after_del FROM cs_cnt;
 
 -- Mixed delta + columnar
 INSERT INTO cs_cnt SELECT i FROM generate_series(3000, 3100) i;

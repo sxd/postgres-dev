@@ -258,6 +258,11 @@ static void cs_ensure_column_loaded_internal(CSColumnCache *cache,
 											 Relation rel, int col);
 static void cs_base_decompress_column_internal(CSColumnCache *cache,
 											   Relation rel, int col);
+bool		cs_load_rowgroup(CScanDesc scan, Relation rel, uint32 rg_id);
+bool		cs_load_rowgroup_into(CSColumnCache *cache, Relation rel,
+								  BlockNumber catalog_block, int natts);
+void		cs_ensure_column_loaded(CSColumnCache *cache, Relation rel,
+									int col);
 static void cs_zonemap_init_cmp_cache(CScanDesc scan);
 static bool cs_zonemap_skip_rowgroup(CScanDesc scan, CSRowGroupDesc *rg_desc);
 static void cs_init_array_scan_keys(CScanDesc scan);
@@ -271,6 +276,10 @@ static void cs_preload_qual_columns(CScanDesc scan, CSColumnCache *cache,
 									Relation rel);
 static void cs_build_selection_bitmap(CScanDesc scan, CSColumnCache *cache,
 									  Relation rel);
+static bool cs_load_rowgroup_countonly(CScanDesc scan, Relation rel,
+									   uint32 rg_id);
+static bool cs_columnar_getnext_countonly(CScanDesc scan,
+										  TupleTableSlot *slot);
 static bool cs_parallel_getnextslot(TableScanDesc sscan,
 									ScanDirection direction,
 									TupleTableSlot *slot);
@@ -421,8 +430,12 @@ cs_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKeyData *key,
 	 * inside a caller's per-row memory context (e.g. ATRewriteTable), which
 	 * must not own scan-lifetime state.
 	 */
-	scan->delta_visible_offsets =
-		palloc(sizeof(OffsetNumber) * MaxHeapTuplesPerPage);
+	scan->delta_visible_tuples =
+		palloc(sizeof(HeapTuple) * MaxHeapTuplesPerPage);
+	scan->delta_tuple_cxt =
+		AllocSetContextCreate(CurrentMemoryContext,
+							  "columnstore delta tuples",
+							  ALLOCSET_DEFAULT_SIZES);
 	scan->delta_nvisible = 0;
 	scan->delta_visible_idx = 0;
 
@@ -624,8 +637,10 @@ cs_scan_end(TableScanDesc sscan)
 		scan->delta_buf = InvalidBuffer;
 	}
 
-	if (scan->delta_visible_offsets)
-		pfree(scan->delta_visible_offsets);
+	if (scan->delta_visible_tuples)
+		pfree(scan->delta_visible_tuples);
+	if (scan->delta_tuple_cxt)
+		MemoryContextDelete(scan->delta_tuple_cxt);
 
 	if (scan->rg_catalog_blocks)
 		pfree(scan->rg_catalog_blocks);
@@ -689,6 +704,7 @@ cs_scan_rescan(TableScanDesc sscan, ScanKeyData *key,
 	scan->delta_cur_offset = InvalidOffsetNumber;
 	scan->delta_nvisible = 0;
 	scan->delta_visible_idx = 0;
+	MemoryContextReset(scan->delta_tuple_cxt);
 
 	scan->columnar_done = false;
 	scan->cur_rowgroup = 0;
@@ -703,14 +719,22 @@ cs_scan_rescan(TableScanDesc sscan, ScanKeyData *key,
 
 	scan->sel_bitmap_valid = false;
 
-	/* Reset tombstones so they're re-collected with potentially new snapshot */
-	if (scan->tombstone_tids)
+	/*
+	 * The visible-tombstone set is a pure function of the snapshot, so keep
+	 * it across rescans (nestloop inner scans rescan once per outer row) and
+	 * re-collect only if the scan was given a new snapshot.
+	 */
+	if (scan->tombstones_collected &&
+		scan->tombstone_snapshot != sscan->rs_snapshot)
 	{
-		pfree(scan->tombstone_tids);
-		scan->tombstone_tids = NULL;
+		if (scan->tombstone_tids)
+		{
+			pfree(scan->tombstone_tids);
+			scan->tombstone_tids = NULL;
+		}
+		scan->tombstone_count = 0;
+		scan->tombstones_collected = false;
 	}
-	scan->tombstone_count = 0;
-	scan->tombstones_collected = false;
 
 	/* Restart TABLESAMPLE and bitmap-scan state */
 	scan->sample_inited = false;
@@ -739,6 +763,158 @@ cs_scan_rescan(TableScanDesc sscan, ScanKeyData *key,
 
 	if (key)
 		sscan->rs_key = key;
+}
+
+/*
+ * Collect tombstones visible to the current snapshot.
+ *
+ * Scans all delta pages for tombstone tuples (natts = 0, t_ctid in columnar
+ * space) and records the target virtual TIDs of those visible under the
+ * scan's snapshot.  The array is sorted for binary search during row-level
+ * visibility checks.
+ */
+void
+cs_collect_tombstones(CScanDesc scan)
+{
+	/*
+	 * Index builds must index rows with pending or committed deletes too:
+	 * older snapshots may still see them, and the fetch path hides what a
+	 * given snapshot must not.  Applying tombstones here -- worse, under
+	 * SnapshotAny, where even an aborted delete reads as one -- would leave
+	 * those rows out of the index for good.
+	 */
+	Relation	rel = scan->rs_base.rs_rd;
+	Snapshot	snapshot = scan->rs_base.rs_snapshot;
+	BlockNumber blkno;
+	BlockNumber end_blk;
+	ItemPointerData *tids = NULL;
+	int			count = 0;
+	int			capacity = 0;
+
+	if (scan->rs_index_build)
+	{
+		scan->tombstone_count = 0;
+		scan->tombstones_collected = true;
+		return;
+	}
+
+	scan->tombstones_collected = true;
+	scan->tombstone_snapshot = snapshot;
+	scan->tombstone_count = 0;
+	scan->tombstone_tids = NULL;
+
+	if (scan->delta_nblocks == 0)
+		return;
+
+	end_blk = scan->delta_start + scan->delta_nblocks;
+
+	for (blkno = scan->delta_start; blkno < end_blk; blkno++)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber off;
+
+		buf = ReadBuffer(rel, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		if (!CSPageIsDelta(page))
+		{
+			/* foreign page interleaved into the delta range; skip */
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+		maxoff = PageGetMaxOffsetNumber(page);
+
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			ItemId		itemid;
+			HeapTupleHeader htup;
+			HeapTupleData tuple;
+
+			itemid = PageGetItemId(page, off);
+			if (!ItemIdIsNormal(itemid))
+				continue;
+
+			htup = (HeapTupleHeader) PageGetItem(page, itemid);
+			if (!CS_IS_TOMBSTONE(htup))
+				continue;
+
+			/* row locks are not deletes */
+			if (CS_TOMBSTONE_IS_LOCK_ONLY(htup))
+				continue;
+
+			/*
+			 * Check visibility: is this delete committed from our
+			 * perspective?
+			 */
+			tuple.t_data = htup;
+			tuple.t_len = ItemIdGetLength(itemid);
+			tuple.t_tableOid = RelationGetRelid(rel);
+			ItemPointerSet(&tuple.t_self, blkno, off);
+
+			if (!cs_delta_satisfies_visibility(&tuple, snapshot))
+				continue;
+
+			/* Add target TID to array */
+			if (count >= capacity)
+			{
+				if (capacity == 0)
+				{
+					/*
+					 * The array must outlive any per-row context we may be
+					 * called from; repalloc keeps the original context.
+					 */
+					capacity = 32;
+					tids = MemoryContextAlloc(scan->colcache.cc_cxt,
+											  sizeof(ItemPointerData) * capacity);
+				}
+				else
+				{
+					capacity *= 2;
+					tids = repalloc_array(tids, ItemPointerData, capacity);
+				}
+			}
+			tids[count++] = htup->t_ctid;
+		}
+
+		UnlockReleaseBuffer(buf);
+	}
+
+	if (count > 1)
+	{
+		/* Sort by TID for binary search */
+		qsort(tids, count, sizeof(ItemPointerData),
+			  (int (*) (const void *, const void *)) ItemPointerCompare);
+	}
+
+	scan->tombstone_tids = tids;
+	scan->tombstone_count = count;
+}
+
+/*
+ * Binary search for a virtual TID in a sorted tombstone array.
+ */
+bool
+cs_tombstone_lookup(ItemPointerData *tids, int count, ItemPointer target)
+{
+	int			lo = 0;
+	int			hi = count - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+		int			cmp = ItemPointerCompare(&tids[mid], target);
+
+		if (cmp == 0)
+			return true;
+		else if (cmp < 0)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
+	return false;
 }
 
 /*
@@ -824,45 +1000,6 @@ cs_scan_set_qual_keys(TableScanDesc sscan, int nkeys, ScanKeyData *keys)
 	/* No row groups means the cache could never be consulted */
 	if (nkeys > 0 && scan->nrowgroups > 0)
 		cs_zonemap_init_cmp_cache(scan);
-}
-
-/*
- * Collect tombstones visible to the current snapshot.
- *
- * Stub for step 4: columnar DELETE arrives in step 5, so there are no
- * tombstones to collect yet.  The real walk-the-delta-pages implementation
- * replaces this body in step 5.
- */
-void
-cs_collect_tombstones(CScanDesc scan)
-{
-	scan->tombstones_collected = true;
-	scan->tombstone_count = 0;
-	scan->tombstone_tids = NULL;
-}
-
-/*
- * Binary search for a virtual TID in a sorted tombstone array.
- */
-bool
-cs_tombstone_lookup(ItemPointerData *tids, int count, ItemPointer target)
-{
-	int			lo = 0;
-	int			hi = count - 1;
-
-	while (lo <= hi)
-	{
-		int			mid = lo + (hi - lo) / 2;
-		int			cmp = ItemPointerCompare(&tids[mid], target);
-
-		if (cmp == 0)
-			return true;
-		else if (cmp < 0)
-			lo = mid + 1;
-		else
-			hi = mid - 1;
-	}
-	return false;
 }
 
 /*
@@ -1482,6 +1619,22 @@ cs_preload_qual_columns(CScanDesc scan, CSColumnCache *cache, Relation rel)
 }
 
 /*
+ * Build a selection bitmap for the current row group.
+ *
+ * The bitmap has one bit per row: bit set = passes all quals, bit clear =
+ * filtered out.  It incorporates the deletion bitmap and all pushed-down
+ * predicates (scan keys and bloom filters), so the inner scan loop only
+ * needs to test bits and check tombstones.
+ *
+ * For fixed-width integer types the comparison is done in tight loops
+ * over contiguous column arrays, enabling compiler auto-vectorization.
+ * Dictionary-encoded columns use pre-computed match arrays.  Other types
+ * fall back to per-row FunctionCall2Coll evaluation.
+ *
+ * Must be called after cs_preload_qual_columns() has decompressed all
+ * qual columns for the current row group.
+ */
+/*
  * Apply a dictionary match array to the selection bitmap.
  * Deselects rows whose dictionary code does not appear in the match table.
  */
@@ -1710,22 +1863,6 @@ cs_sel_bitmap_apply_nulls(char *sel_bitmap, char *null_bitmap,
 	}
 }
 
-/*
- * Build a selection bitmap for the current row group.
- *
- * The bitmap has one bit per row: bit set = passes all quals, bit clear =
- * filtered out.  It incorporates the deletion bitmap and all pushed-down
- * predicates (scan keys and bloom filters), so the inner scan loop only
- * needs to test bits and check tombstones.
- *
- * For fixed-width integer types the comparison is done in tight loops
- * over contiguous column arrays, enabling compiler auto-vectorization.
- * Dictionary-encoded columns use pre-computed match arrays.  Other types
- * fall back to per-row FunctionCall2Coll evaluation.
- *
- * Must be called after cs_preload_qual_columns() has decompressed all
- * qual columns for the current row group.
- */
 static void
 cs_build_selection_bitmap(CScanDesc scan, CSColumnCache *cache, Relation rel)
 {
@@ -2348,67 +2485,6 @@ cs_zonemap_skip_rowgroup(CScanDesc scan, CSRowGroupDesc *rg_desc)
 }
 
 /*
- * Push a bloom filter down to the scan for hash join probe filtering.
- *
- * Each call pushes one filter for one column.  Up to 8 filters can be
- * active simultaneously.  Passing filter=NULL clears all filters.
- */
-void
-cs_scan_set_bloom_filter(TableScanDesc sscan, AttrNumber attno,
-						 bloom_filter *filter)
-{
-	CScanDesc	scan = (CScanDesc) sscan;
-
-	/* NULL filter means clear all filters */
-	if (filter == NULL)
-	{
-		for (int i = 0; i < scan->bf_nfilters; i++)
-		{
-			if (scan->bf_dk_match && scan->bf_dk_match[i])
-			{
-				pfree(scan->bf_dk_match[i]);
-				scan->bf_dk_match[i] = NULL;
-			}
-		}
-		if (scan->bf_filters)
-			pfree(scan->bf_filters);
-		if (scan->bf_attnos)
-			pfree(scan->bf_attnos);
-		if (scan->bf_dk_match)
-			pfree(scan->bf_dk_match);
-		if (scan->bf_dk_match_rg)
-			pfree(scan->bf_dk_match_rg);
-		scan->bf_filters = NULL;
-		scan->bf_attnos = NULL;
-		scan->bf_dk_match = NULL;
-		scan->bf_dk_match_rg = NULL;
-		scan->bf_nfilters = 0;
-		return;
-	}
-
-	/* Allocate arrays on first push */
-	if (scan->bf_nfilters == 0)
-	{
-		scan->bf_filters = palloc(sizeof(bloom_filter *) * 8);
-		scan->bf_attnos = palloc(sizeof(AttrNumber) * 8);
-		scan->bf_dk_match = palloc0(sizeof(bool *) * 8);
-		scan->bf_dk_match_rg = palloc(sizeof(uint32) * 8);
-		for (int i = 0; i < 8; i++)
-			scan->bf_dk_match_rg[i] = UINT32_MAX;
-	}
-
-	/* Append the new filter (limit to 8) */
-	if (scan->bf_nfilters < 8)
-	{
-		int			idx = scan->bf_nfilters;
-
-		scan->bf_filters[idx] = filter;
-		scan->bf_attnos[idx] = attno;
-		scan->bf_nfilters++;
-	}
-}
-
-/*
  * MVCC visibility check that does not dirty the buffer page.
  *
  * HeapTupleSatisfiesVisibility() may write hint bits (HEAP_XMIN_COMMITTED,
@@ -2463,19 +2539,14 @@ cs_delta_getnext(CScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
 		while (scan->delta_visible_idx < scan->delta_nvisible)
 		{
 			CSTupleTableSlot *csslot = (CSTupleTableSlot *) slot;
-			Page		page;
-			ItemId		itemid;
-			HeapTupleData tuple;
-			OffsetNumber off;
+			HeapTuple	tuple;
 
-			off = scan->delta_visible_offsets[scan->delta_visible_idx++];
-			page = BufferGetPage(scan->delta_buf);
-			itemid = PageGetItemId(page, off);
-
-			tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
-			tuple.t_len = ItemIdGetLength(itemid);
-			tuple.t_tableOid = RelationGetRelid(rel);
-			ItemPointerSet(&tuple.t_self, scan->delta_cur_block, off);
+			/*
+			 * Return the copy taken under the share lock in the pre-scan; the
+			 * page itself is only pinned now and may be under concurrent
+			 * rewrite by compaction.
+			 */
+			tuple = scan->delta_visible_tuples[scan->delta_visible_idx++];
 
 			/*
 			 * Deform with the SLOT's descriptor, not the relation's: during
@@ -2484,7 +2555,7 @@ cs_delta_getnext(CScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
 			 * slot) still have the old format.
 			 */
 			ExecClearTuple(slot);
-			heap_deform_tuple(&tuple, slot->tts_tupleDescriptor,
+			heap_deform_tuple(tuple, slot->tts_tupleDescriptor,
 							  slot->tts_values, slot->tts_isnull);
 
 			csslot->cs_scan = NULL;
@@ -2492,8 +2563,8 @@ cs_delta_getnext(CScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
 			csslot->cs_is_columnar = false;
 			slot->tts_nvalid = slot->tts_tupleDescriptor->natts;
 			slot->tts_flags &= ~TTS_FLAG_EMPTY;
-			slot->tts_tid = tuple.t_self;
-			slot->tts_tableOid = tuple.t_tableOid;
+			slot->tts_tid = tuple->t_self;
+			slot->tts_tableOid = tuple->t_tableOid;
 			return true;
 		}
 
@@ -2526,6 +2597,7 @@ cs_delta_getnext(CScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
 
 			scan->delta_nvisible = 0;
 			scan->delta_visible_idx = 0;
+			MemoryContextReset(scan->delta_tuple_cxt);
 
 			/*
 			 * Skip foreign pages: concurrent relation extension can
@@ -2535,12 +2607,13 @@ cs_delta_getnext(CScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
 			maxoff = CSPageIsDelta(page) ?
 				PageGetMaxOffsetNumber(page) : InvalidOffsetNumber;
 
-			Assert(scan->delta_visible_offsets != NULL);
+			Assert(scan->delta_visible_tuples != NULL);
 
 			for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
 			{
 				ItemId		itemid;
 				HeapTupleData tuple;
+				MemoryContext oldcxt;
 
 				itemid = PageGetItemId(page, off);
 				if (!ItemIdIsNormal(itemid))
@@ -2577,7 +2650,16 @@ cs_delta_getnext(CScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
 				else if (!cs_delta_satisfies_visibility(&tuple, snapshot))
 					continue;
 
-				scan->delta_visible_offsets[scan->delta_nvisible++] = off;
+				/*
+				 * Copy the tuple into scan memory while we still hold the
+				 * share lock; rows are returned from this copy, not by
+				 * re-reading the (then unlocked) page.
+				 */
+				oldcxt = MemoryContextSwitchTo(scan->delta_tuple_cxt);
+				scan->delta_visible_tuples[scan->delta_nvisible] =
+					heap_copytuple(&tuple);
+				MemoryContextSwitchTo(oldcxt);
+				scan->delta_nvisible++;
 			}
 		}
 
@@ -4079,12 +4161,16 @@ cs_load_rowgroup(CScanDesc scan, Relation rel, uint32 rg_id)
 		cs_cache_load_delbitmap(cache, rel, rg_desc);
 
 		cache->col_nrows = rg_desc->rg_num_rows;
+		scan->sel_bitmap_valid = false;
 		return true;
 	}
 
 	if (cs_load_rowgroup_into(cache, rel,
 							  scan->rg_catalog_blocks[rg_id], natts))
+	{
+		scan->sel_bitmap_valid = false;
 		return true;
+	}
 	return false;
 }
 
@@ -4128,9 +4214,10 @@ cs_load_rowgroup_countonly(CScanDesc scan, Relation rel, uint32 rg_id)
 /*
  * Fast-path columnar scan for COUNT(*) -- no columns needed.
  *
- * Iterates per-row, checking the deletion bitmap.  No column data is
- * decompressed (the slot stays all-null), but we produce valid virtual
- * TIDs so that DML callers work correctly.
+ * When no scan keys are present, uses a simple counter per row group
+ * (rg_num_rows - rg_num_deleted) without reading the deletion bitmap
+ * or iterating per-row.  With scan keys, falls back to per-row iteration
+ * checking the deletion bitmap.
  */
 static bool
 cs_columnar_getnext_countonly(CScanDesc scan, TupleTableSlot *slot)
@@ -4141,6 +4228,11 @@ cs_columnar_getnext_countonly(CScanDesc scan, TupleTableSlot *slot)
 
 	while (!scan->columnar_done)
 	{
+		/*
+		 * Iterate per-row, checking the deletion bitmap and tombstones. No
+		 * column data is decompressed (the slot stays all-null), but we
+		 * produce valid virtual TIDs so that DML callers work correctly.
+		 */
 		if (cache->col_nrows > 0 &&
 			scan->cur_row_in_group < cache->col_nrows)
 		{
@@ -4155,6 +4247,17 @@ cs_columnar_getnext_countonly(CScanDesc scan, TupleTableSlot *slot)
 			if (cache->cur_delbitmap != NULL)
 			{
 				if (CS_ISDELETED(cache->cur_delbitmap, row))
+					continue;
+			}
+
+			/* Skip rows with visible tombstones (pending MVCC deletes) */
+			if (scan->tombstone_count > 0)
+			{
+				ItemPointerData vtid;
+
+				cs_encode_virtual_tid(&vtid, rg_id, row);
+				if (cs_tombstone_lookup(scan->tombstone_tids,
+										scan->tombstone_count, &vtid))
 					continue;
 			}
 
@@ -4314,10 +4417,21 @@ cs_columnar_getnext(CScanDesc scan, TupleTableSlot *slot)
 			{
 				/*
 				 * Selection bitmap incorporates deletion bitmap and all
-				 * pushed-down predicates.
+				 * pushed-down predicates.  Only tombstones need per-row
+				 * checking (they are rare MVCC pending deletes).
 				 */
 				if (!CS_ISSELECTED(scan->sel_bitmap, row))
 					continue;
+
+				if (scan->tombstone_count > 0)
+				{
+					ItemPointerData vtid;
+
+					cs_encode_virtual_tid(&vtid, rg_id, row);
+					if (cs_tombstone_lookup(scan->tombstone_tids,
+											scan->tombstone_count, &vtid))
+						continue;
+				}
 			}
 			else
 			{
@@ -4325,6 +4439,16 @@ cs_columnar_getnext(CScanDesc scan, TupleTableSlot *slot)
 				if (cache->cur_delbitmap != NULL)
 				{
 					if (CS_ISDELETED(cache->cur_delbitmap, row))
+						continue;
+				}
+
+				if (scan->tombstone_count > 0)
+				{
+					ItemPointerData vtid;
+
+					cs_encode_virtual_tid(&vtid, rg_id, row);
+					if (cs_tombstone_lookup(scan->tombstone_tids,
+											scan->tombstone_count, &vtid))
 						continue;
 				}
 
@@ -4657,4 +4781,65 @@ cs_scan_get_raw_attr(TableScanDesc sscan, TupleTableSlot *slot,
 	*isnull = false;
 	*value = Int64GetDatum(((int64 *) cache->col_raw_data[col])[row]);
 	return true;
+}
+
+/*
+ * Push a bloom filter down to the scan for hash join probe filtering.
+ *
+ * Each call pushes one filter for one column.  Up to 8 filters can be
+ * active simultaneously.  Passing filter=NULL clears all filters.
+ */
+void
+cs_scan_set_bloom_filter(TableScanDesc sscan, AttrNumber attno,
+						 bloom_filter *filter)
+{
+	CScanDesc	scan = (CScanDesc) sscan;
+
+	/* NULL filter means clear all filters */
+	if (filter == NULL)
+	{
+		for (int i = 0; i < scan->bf_nfilters; i++)
+		{
+			if (scan->bf_dk_match && scan->bf_dk_match[i])
+			{
+				pfree(scan->bf_dk_match[i]);
+				scan->bf_dk_match[i] = NULL;
+			}
+		}
+		if (scan->bf_filters)
+			pfree(scan->bf_filters);
+		if (scan->bf_attnos)
+			pfree(scan->bf_attnos);
+		if (scan->bf_dk_match)
+			pfree(scan->bf_dk_match);
+		if (scan->bf_dk_match_rg)
+			pfree(scan->bf_dk_match_rg);
+		scan->bf_filters = NULL;
+		scan->bf_attnos = NULL;
+		scan->bf_dk_match = NULL;
+		scan->bf_dk_match_rg = NULL;
+		scan->bf_nfilters = 0;
+		return;
+	}
+
+	/* Allocate arrays on first push */
+	if (scan->bf_nfilters == 0)
+	{
+		scan->bf_filters = palloc(sizeof(bloom_filter *) * 8);
+		scan->bf_attnos = palloc(sizeof(AttrNumber) * 8);
+		scan->bf_dk_match = palloc0(sizeof(bool *) * 8);
+		scan->bf_dk_match_rg = palloc(sizeof(uint32) * 8);
+		for (int i = 0; i < 8; i++)
+			scan->bf_dk_match_rg[i] = UINT32_MAX;
+	}
+
+	/* Append the new filter (limit to 8) */
+	if (scan->bf_nfilters < 8)
+	{
+		int			idx = scan->bf_nfilters;
+
+		scan->bf_filters[idx] = filter;
+		scan->bf_attnos[idx] = attno;
+		scan->bf_nfilters++;
+	}
 }

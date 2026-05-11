@@ -26,9 +26,20 @@ $node->safe_psql('postgres',
 $node->safe_psql('postgres',
 	"INSERT INTO wl SELECT g, 'w' || g FROM generate_series(1, 5000) g");
 
+# delta-row locks (lock-only xmax stamps)
+$node->safe_psql('postgres',
+	'BEGIN; SELECT id FROM wl WHERE id IN (1,2,3) FOR UPDATE; COMMIT;');
+
 # compaction: fences, consumption, freeze
 $node->safe_psql('postgres', 'VACUUM wl');
 
+# columnar-row locks (lock-only tombstones) and deletes (tombstones)
+$node->safe_psql('postgres',
+	'BEGIN; SELECT id FROM wl WHERE id IN (10,11) FOR KEY SHARE; COMMIT;');
+$node->safe_psql('postgres', 'DELETE FROM wl WHERE id % 10 = 0');
+
+# tombstone materialization + another compaction round
+$node->safe_psql('postgres', 'VACUUM wl');
 
 # crash hard and recover: every Generic record replayed is verified
 # against the full-page image wal_consistency_checking attached to it
@@ -36,7 +47,7 @@ $node->stop('immediate');
 $node->start;
 
 my $count = $node->safe_psql('postgres', 'SELECT count(*) FROM wl');
-is($count, 5000, 'data intact after crash recovery');
+cmp_ok($count, '==', 4500, 'data intact after crash recovery');
 
 my $log = slurp_file($node->logfile);
 unlike(

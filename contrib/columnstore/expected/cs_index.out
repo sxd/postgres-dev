@@ -46,6 +46,16 @@ SELECT count(*) FROM cs_idx WHERE id BETWEEN 450 AND 550;
    101
 (1 row)
 
+-- Range scan with deletions (re-enable seqscan for the DELETE)
+RESET enable_seqscan;
+DELETE FROM cs_idx WHERE id BETWEEN 490 AND 510;
+SET enable_seqscan = off;
+SELECT count(*) FROM cs_idx WHERE id BETWEEN 480 AND 520;
+ count 
+-------
+    20
+(1 row)
+
 RESET enable_seqscan;
 -- Partial index (predicate must be evaluated during build)
 CREATE INDEX cs_idx_partial ON cs_idx (id) WHERE id > 500;
@@ -53,7 +63,7 @@ SET enable_seqscan = off;
 SELECT count(*) FROM cs_idx WHERE id > 500 AND id <= 600;
  count 
 -------
-   100
+    90
 (1 row)
 
 RESET enable_seqscan;
@@ -89,6 +99,18 @@ SELECT count(*) FROM cs_ios WHERE id BETWEEN 1 AND 100;
  count 
 -------
    100
+(1 row)
+
+-- After deletion, IOS should still work
+RESET enable_seqscan;
+RESET enable_indexscan;
+DELETE FROM cs_ios WHERE id = 500;
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SELECT count(*) FROM cs_ios WHERE id BETWEEN 490 AND 510;
+ count 
+-------
+    20
 (1 row)
 
 RESET enable_seqscan;
@@ -128,6 +150,45 @@ SELECT id, category, amount FROM cs_idx_pred WHERE category = 'cat_0' AND id <= 
 
 RESET enable_seqscan;
 DROP TABLE cs_idx_pred;
+-- ===================================================================
+-- Index scan after UPDATE (mix of columnar + delta)
+-- ===================================================================
+CREATE TABLE cs_idx_upd (id int, val text) USING columnstore;
+INSERT INTO cs_idx_upd SELECT i, 'orig_' || i FROM generate_series(1, 500) i;
+VACUUM cs_idx_upd;
+CREATE INDEX cs_idx_upd_id ON cs_idx_upd (id);
+-- Update creates delta rows
+UPDATE cs_idx_upd SET val = 'updated' WHERE id BETWEEN 100 AND 110;
+SET enable_seqscan = off;
+-- Old columnar rows should be gone (via deletion bitmap)
+-- Updated rows should be found in delta store
+SELECT id, val FROM cs_idx_upd WHERE id = 100;
+ id  |   val   
+-----+---------
+ 100 | updated
+(1 row)
+
+SELECT id, val FROM cs_idx_upd WHERE id = 105;
+ id  |   val   
+-----+---------
+ 105 | updated
+(1 row)
+
+-- Non-updated row still in columnar
+SELECT id, val FROM cs_idx_upd WHERE id = 99;
+ id |   val   
+----+---------
+ 99 | orig_99
+(1 row)
+
+SELECT count(*) AS total FROM cs_idx_upd WHERE id BETWEEN 95 AND 115;
+ total 
+-------
+    21
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE cs_idx_upd;
 -- ===================================================================
 -- CREATE INDEX CONCURRENTLY
 -- ===================================================================

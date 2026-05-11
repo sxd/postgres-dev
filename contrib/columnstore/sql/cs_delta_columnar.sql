@@ -25,9 +25,13 @@ SELECT count(*) AS delta_rows FROM cs_mixed WHERE id > 500;
 SELECT sum(num) AS total_sum FROM cs_mixed;
 SELECT min(num) AS total_min, max(num) AS total_max FROM cs_mixed;
 
--- Delta delete (columnar DELETE is exercised by later commits)
+-- Deletions in both stores
+DELETE FROM cs_mixed WHERE id = 100;  -- columnar
 DELETE FROM cs_mixed WHERE id = 550;  -- delta
 SELECT count(*) AS after_delete FROM cs_mixed;
+
+-- Verify deleted rows are gone
+SELECT count(*) FROM cs_mixed WHERE id = 100;
 SELECT count(*) FROM cs_mixed WHERE id = 550;
 
 -- Remaining rows still correct

@@ -250,6 +250,18 @@ extern bytea *cs_reloptions(Datum reloptions, bool validate);
 	 ItemPointerGetBlockNumber(&(htup)->t_ctid) >= CS_COLUMNAR_BLKNO_BASE)
 
 /*
+ * A lock-only tombstone records a row lock (cs_tuple_lock) on a columnar
+ * row, not a delete: its xmin is the locker and HEAP_XMAX_LOCK_ONLY is
+ * set in t_infomask, with the KEYSHR/EXCL bits encoding the lock mode as
+ * heap encodes lock-only xmax modes.  Visibility paths must ignore it
+ * (the target row stays live); deleters and other lockers treat an
+ * in-progress one as a conflict.  VACUUM never materializes it and
+ * reaps it once the locking transaction has ended.
+ */
+#define CS_TOMBSTONE_IS_LOCK_ONLY(htup) \
+	(((htup)->t_infomask & HEAP_XMAX_LOCK_ONLY) != 0)
+
+/*
  * Encode a (rg_id, row_offset) pair into a virtual TID.  Inverse of the
  * decode in cs_columnar_delete / cs_index_fetch_tuple.
  */
@@ -579,10 +591,21 @@ typedef struct CScanDescData
 	Buffer		delta_buf;		/* currently pinned delta page buffer */
 	bool		delta_done;		/* finished scanning delta? */
 
-	/* page-mode: pre-scanned visible offsets for the current delta page */
-	OffsetNumber *delta_visible_offsets;
-	int			delta_nvisible; /* number of visible offsets */
+	/* page-mode: pre-scanned visible tuples for the current delta page */
+	int			delta_nvisible; /* number of visible tuples */
 	int			delta_visible_idx;	/* next index to return */
+
+	/*
+	 * Copies of the visible delta tuples for the current page, taken under
+	 * the page's share lock.  Rows are returned from these copies, never by
+	 * re-reading the page: the scan keeps only a pin between getnext() calls,
+	 * and columnstore compaction rewrites delta pages in place (GenericXLog,
+	 * exclusive lock -- not a cleanup lock), so a concurrent VACUUM could
+	 * tear the page bytes out from under an unlocked read.  Held in
+	 * delta_tuple_cxt, reset once per page.
+	 */
+	HeapTuple  *delta_visible_tuples;
+	MemoryContext delta_tuple_cxt;
 
 	/* columnar scan state */
 	bool		columnar_done;	/* finished scanning columnar? */
@@ -658,6 +681,7 @@ typedef struct CScanDescData
 	ItemPointerData *tombstone_tids;	/* sorted virtual TIDs of deleted rows */
 	int			tombstone_count;
 	bool		tombstones_collected;	/* lazy init flag */
+	Snapshot	tombstone_snapshot; /* snapshot the tids were collected under */
 
 	/* Selection bitmap: batch-evaluated predicate results per row group */
 	char	   *sel_bitmap;		/* one bit per row, 1=passes all quals */
@@ -843,7 +867,8 @@ extern void cs_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 extern void cs_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 							CommandId cid, uint32 options,
 							BulkInsertStateData *bistate);
-extern void cs_delta_insert_tombstone(Relation rel, ItemPointer target_tid);
+extern void cs_delta_insert_tombstone(Relation rel, ItemPointer target_tid,
+									  uint16 extra_infomask);
 
 /* cs_scan.c */
 extern bool cs_delta_satisfies_visibility(HeapTupleData *tuple,

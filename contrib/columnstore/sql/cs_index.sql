@@ -27,6 +27,12 @@ SELECT id, val FROM cs_idx WHERE id = 1050;
 -- Range scan spanning row groups
 SELECT count(*) FROM cs_idx WHERE id BETWEEN 450 AND 550;
 
+-- Range scan with deletions (re-enable seqscan for the DELETE)
+RESET enable_seqscan;
+DELETE FROM cs_idx WHERE id BETWEEN 490 AND 510;
+SET enable_seqscan = off;
+SELECT count(*) FROM cs_idx WHERE id BETWEEN 480 AND 520;
+
 RESET enable_seqscan;
 
 -- Partial index (predicate must be evaluated during build)
@@ -57,6 +63,14 @@ SELECT id, val FROM cs_ios WHERE id = 500;
 -- Range query via IOS
 SELECT count(*) FROM cs_ios WHERE id BETWEEN 1 AND 100;
 
+-- After deletion, IOS should still work
+RESET enable_seqscan;
+RESET enable_indexscan;
+DELETE FROM cs_ios WHERE id = 500;
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SELECT count(*) FROM cs_ios WHERE id BETWEEN 490 AND 510;
+
 RESET enable_seqscan;
 RESET enable_indexscan;
 DROP TABLE cs_ios;
@@ -86,6 +100,30 @@ SELECT id, category, amount FROM cs_idx_pred WHERE category = 'cat_0' AND id <= 
 
 RESET enable_seqscan;
 DROP TABLE cs_idx_pred;
+
+-- ===================================================================
+-- Index scan after UPDATE (mix of columnar + delta)
+-- ===================================================================
+CREATE TABLE cs_idx_upd (id int, val text) USING columnstore;
+INSERT INTO cs_idx_upd SELECT i, 'orig_' || i FROM generate_series(1, 500) i;
+VACUUM cs_idx_upd;
+CREATE INDEX cs_idx_upd_id ON cs_idx_upd (id);
+
+-- Update creates delta rows
+UPDATE cs_idx_upd SET val = 'updated' WHERE id BETWEEN 100 AND 110;
+
+SET enable_seqscan = off;
+
+-- Old columnar rows should be gone (via deletion bitmap)
+-- Updated rows should be found in delta store
+SELECT id, val FROM cs_idx_upd WHERE id = 100;
+SELECT id, val FROM cs_idx_upd WHERE id = 105;
+-- Non-updated row still in columnar
+SELECT id, val FROM cs_idx_upd WHERE id = 99;
+SELECT count(*) AS total FROM cs_idx_upd WHERE id BETWEEN 95 AND 115;
+
+RESET enable_seqscan;
+DROP TABLE cs_idx_upd;
 
 -- ===================================================================
 -- CREATE INDEX CONCURRENTLY

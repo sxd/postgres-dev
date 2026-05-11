@@ -70,11 +70,37 @@ cmp_ok(($count - $expected) % $rows_per_txn,
 ok($count > $expected, "insert phase B added rows");
 $expected = $count;
 
+# Phase C: one bulk DELETE racing repeated VACUUMs.  Exercises
+# tombstone insertion and materialization racing compaction.
+my $deleted = $node->safe_psql('postgres',
+	'SELECT count(*) FROM t WHERE id % 7 = 0');
+my $h = $node->background_psql('postgres');
+$h->query_until(qr/start/, "\\echo start\n");
+
+# Drive the concurrent VACUUMs with IPC::Run::start, not fork()+exec.  perl's
+# fork is emulated on Windows (ithreads); a pseudo-fork that then exec()s
+# corrupts the parent's open file handles -- including the background_psql
+# pipes -- so the DELETE's psql "ends prematurely" (and worse on some MinGW
+# builds).  IPC::Run::start is the portable way to run a child concurrently.
+my @vacuum_cmd = (
+	'pgbench', '-n', '-c', 1, '-t', 10,
+	'-f', $vacuum_script,
+	'-h', $node->host, '-p', $node->port, 'postgres');
+my $vacuum_run = start(\@vacuum_cmd);
+$h->query_safe('DELETE FROM t WHERE id % 7 = 0');
+$h->quit;
+$vacuum_run->finish;
+
+$node->safe_psql('postgres', 'VACUUM t');
+$count = $node->safe_psql('postgres', 'SELECT count(*) FROM t');
+cmp_ok($count, '==', $expected - $deleted,
+	"DELETE racing VACUUM kept exact count");
+
 # Final integrity pass: another VACUUM must not change visible contents.
 my $sum_before = $node->safe_psql('postgres', 'SELECT sum(id) FROM t');
 $node->safe_psql('postgres', 'VACUUM t');
 my $sum_after = $node->safe_psql('postgres', 'SELECT sum(id) FROM t');
-is($sum_after, $sum_before, "VACUUM preserved table contents");
+cmp_ok($sum_after, '==', $sum_before, "VACUUM preserved table contents");
 
 $node->stop;
 done_testing();

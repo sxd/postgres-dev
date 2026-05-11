@@ -22,7 +22,12 @@
 
 #include "cs_internal.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
+#include "access/sysattr.h"
+#include "access/transam.h"
+#include "access/xact.h"
 #include "executor/tuptable.h"
+#include "storage/bufmgr.h"
 #include "utils/expandeddatum.h"
 #include "utils/numeric.h"
 
@@ -30,6 +35,10 @@ static void tts_columnstore_init(TupleTableSlot *slot);
 static void tts_columnstore_release(TupleTableSlot *slot);
 static void tts_columnstore_clear(TupleTableSlot *slot);
 static void tts_columnstore_getsomeattrs(TupleTableSlot *slot, int natts);
+static bool tts_columnstore_read_delta_header(TupleTableSlot *slot,
+											  TransactionId *xmin,
+											  TransactionId *xmax,
+											  CommandId *cid);
 static Datum tts_columnstore_getsysattr(TupleTableSlot *slot, int attnum,
 										bool *isnull);
 static bool tts_columnstore_is_current_xact_tuple(TupleTableSlot *slot);
@@ -359,28 +368,126 @@ tts_columnstore_getsomeattrs(TupleTableSlot *slot, int natts)
 	slot->tts_nvalid = natts;
 }
 
+/*
+ * Read the heap header fields of the delta tuple this slot was filled
+ * from, by TID.  Returns false if the TID no longer references a delta
+ * tuple (e.g. the row has been compacted into columnar form, which can
+ * only happen once it is visible to every transaction).
+ */
+static bool
+tts_columnstore_read_delta_header(TupleTableSlot *slot,
+								  TransactionId *xmin, TransactionId *xmax,
+								  CommandId *cid)
+{
+	Relation	rel;
+	Buffer		buf;
+	Page		page;
+	ItemId		itemid;
+	HeapTupleHeader htup;
+	bool		found = false;
+
+	if (!ItemPointerIsValid(&slot->tts_tid) ||
+		!OidIsValid(slot->tts_tableOid))
+		return false;
+
+	/* the executor holds a lock on the relation already */
+	rel = relation_open(slot->tts_tableOid, NoLock);
+
+	if (ItemPointerGetBlockNumber(&slot->tts_tid) <
+		RelationGetNumberOfBlocks(rel))
+	{
+		buf = ReadBuffer(rel, ItemPointerGetBlockNumber(&slot->tts_tid));
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		if (CSPageIsDelta(page))
+		{
+			itemid = PageGetItemId(page,
+								   ItemPointerGetOffsetNumber(&slot->tts_tid));
+			if (ItemIdIsNormal(itemid))
+			{
+				htup = (HeapTupleHeader) PageGetItem(page, itemid);
+				*xmin = HeapTupleHeaderGetRawXmin(htup);
+				*xmax = (htup->t_infomask & HEAP_XMAX_INVALID) ?
+					InvalidTransactionId : HeapTupleHeaderGetRawXmax(htup);
+				*cid = HeapTupleHeaderGetRawCommandId(htup);
+				found = true;
+			}
+		}
+		UnlockReleaseBuffer(buf);
+	}
+
+	relation_close(rel, NoLock);
+	return found;
+}
+
+/*
+ * System columns for columnstore rows.
+ *
+ * Columnar rows carry no transaction information: compaction only moves
+ * rows already visible to every snapshot, so they behave as frozen.
+ * Delta rows are heap-format; their header is re-read by TID.  This is
+ * what lets ExecOnConflictUpdate's self-insertion check (xmin) work.
+ */
 static Datum
 tts_columnstore_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 {
+	TransactionId xmin = FrozenTransactionId;
+	TransactionId xmax = InvalidTransactionId;
+	CommandId	cid = FirstCommandId;
+
 	Assert(!TTS_EMPTY(slot));
 
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("cannot retrieve a system column in this context")));
+	*isnull = false;
 
-	return 0;
+	if (attnum == SelfItemPointerAttributeNumber)
+		return PointerGetDatum(&slot->tts_tid);
+	if (attnum == TableOidAttributeNumber)
+		return ObjectIdGetDatum(slot->tts_tableOid);
+
+	if (ItemPointerIsValid(&slot->tts_tid) &&
+		ItemPointerGetBlockNumber(&slot->tts_tid) < CS_COLUMNAR_BLKNO_BASE)
+		(void) tts_columnstore_read_delta_header(slot, &xmin, &xmax, &cid);
+
+	switch (attnum)
+	{
+		case MinTransactionIdAttributeNumber:
+			return TransactionIdGetDatum(xmin);
+		case MaxTransactionIdAttributeNumber:
+			return TransactionIdGetDatum(xmax);
+		case MinCommandIdAttributeNumber:
+		case MaxCommandIdAttributeNumber:
+			/* as in heap: cmin and cmax are not distinguishable here */
+			return CommandIdGetDatum(cid);
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot retrieve a system column in this context")));
+			return 0;			/* keep compiler quiet */
+	}
 }
 
 static bool
 tts_columnstore_is_current_xact_tuple(TupleTableSlot *slot)
 {
+	TransactionId xmin = FrozenTransactionId;
+	TransactionId xmax = InvalidTransactionId;
+	CommandId	cid = FirstCommandId;
+
 	Assert(!TTS_EMPTY(slot));
 
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("don't have transaction information for this type of tuple")));
+	/*
+	 * Columnar rows are visible to every transaction by construction, so they
+	 * cannot have been written by the current one.
+	 */
+	if (!ItemPointerIsValid(&slot->tts_tid) ||
+		ItemPointerGetBlockNumber(&slot->tts_tid) >= CS_COLUMNAR_BLKNO_BASE)
+		return false;
 
-	return false;
+	if (!tts_columnstore_read_delta_header(slot, &xmin, &xmax, &cid))
+		return false;
+
+	return TransactionIdIsCurrentTransactionId(xmin);
 }
 
 /*

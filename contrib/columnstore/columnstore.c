@@ -20,8 +20,8 @@
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/htup_details.h"
-#include "access/multixact.h"
 #include "access/reloptions.h"
+#include "access/multixact.h"
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/tsmapi.h"
@@ -48,6 +48,10 @@
 #include "utils/snapmgr.h"
 #include "utils/tuplesort.h"
 
+#ifdef USE_LZ4
+#include <lz4.h>
+#endif
+
 PG_MODULE_MAGIC;
 
 /* Forward declarations */
@@ -55,6 +59,24 @@ static const TupleTableSlotOps *cs_slot_callbacks(Relation rel);
 static TM_Result cs_delta_delete(Relation rel, ItemPointer tid,
 								 CommandId cid, TransactionId xid,
 								 bool wait, TM_FailureData *tmfd);
+static TM_Result cs_columnar_delete(Relation rel, ItemPointer tid,
+									CommandId cid, bool wait,
+									TM_FailureData *tmfd);
+static TransactionId cs_find_lock_tombstone_for_tid(Relation rel,
+													CSMetaPageData *meta,
+													ItemPointer target_tid,
+													uint16 *lock_infomask);
+static TransactionId cs_find_tombstone_for_tid(Relation rel,
+											   CSMetaPageData *meta,
+											   ItemPointer target_tid,
+											   CommandId *tomb_cmin);
+static bool cs_has_visible_tombstone(Relation rel, CSMetaPageData *meta,
+									 ItemPointer target_tid,
+									 Snapshot snapshot);
+static void cs_collect_tombstones_for_index(CSIndexFetchData *cscan,
+											Relation rel,
+											CSMetaPageData *meta,
+											Snapshot snapshot);
 static TM_Result cs_tuple_delete(Relation rel, ItemPointer tid,
 								 CommandId cid, uint32 options,
 								 Snapshot snapshot, Snapshot crosscheck,
@@ -66,11 +88,24 @@ static TM_Result cs_tuple_update(Relation rel, ItemPointer otid,
 								 TM_FailureData *tmfd,
 								 LockTupleMode *lockmode,
 								 TU_UpdateIndexes *update_indexes);
+static TM_Result cs_columnar_lock_check(Relation rel, ItemPointer tid,
+										TupleTableSlot *slot,
+										LockTupleMode mode,
+										LockWaitPolicy wait_policy,
+										TM_FailureData *tmfd);
+static TM_Result cs_delta_lock_check(Relation rel, ItemPointer tid,
+									 TupleTableSlot *slot, CommandId cid,
+									 LockTupleMode mode,
+									 LockWaitPolicy wait_policy,
+									 TM_FailureData *tmfd);
 static TM_Result cs_tuple_lock(Relation rel, ItemPointer tid,
 							   Snapshot snapshot, TupleTableSlot *slot,
 							   CommandId cid, LockTupleMode mode,
 							   LockWaitPolicy wait_policy, uint8 flags,
 							   TM_FailureData *tmfd);
+static void cs_fetch_columnar_row(Relation rel, BlockNumber rg_catalog_block,
+								  uint32 row_offset, TupleDesc tupdesc,
+								  Datum *values, bool *isnull);
 static bool cs_fetch_row_version(Relation rel, ItemPointer tid,
 								 Snapshot snapshot, TupleTableSlot *slot);
 static bool cs_tuple_tid_valid(TableScanDesc scan, ItemPointer tid);
@@ -79,10 +114,6 @@ static bool cs_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 										Snapshot snapshot);
 static TransactionId cs_index_delete_tuples(Relation rel,
 											TM_IndexDeleteOp *delstate);
-static void cs_collect_tombstones_for_index(CSIndexFetchData *cscan,
-											Relation rel,
-											CSMetaPageData *meta,
-											Snapshot snapshot);
 static IndexFetchTableData *cs_index_fetch_begin(Relation rel, uint32 flags);
 static void cs_index_fetch_reset(IndexFetchTableData *data);
 static void cs_index_fetch_end(IndexFetchTableData *data);
@@ -109,9 +140,6 @@ static void cs_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
 										 double *num_tuples,
 										 double *tups_vacuumed,
 										 double *tups_recently_dead);
-static void cs_fetch_columnar_row(Relation rel, BlockNumber rg_catalog_block,
-								  uint32 row_offset, TupleDesc tupdesc,
-								  Datum *values, bool *isnull);
 static bool cs_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream);
 static bool cs_scan_analyze_next_tuple(TableScanDesc scan,
 									   double *liverows, double *deadrows,
@@ -216,6 +244,34 @@ cs_delta_delete(Relation rel, ItemPointer tid, CommandId cid,
 			(htup->t_infomask & HEAP_XMAX_INVALID))
 		{
 			/* No deleter -- row is live, proceed */
+			break;
+		}
+
+		if (htup->t_infomask & HEAP_XMAX_LOCK_ONLY)
+		{
+			/*
+			 * xmax is a row lock (cs_tuple_lock), not a delete.  Our own
+			 * lock, or one whose transaction has ended, is simply
+			 * overwritten; a live lock held by someone else blocks us until
+			 * that transaction ends (we also contend on the heavyweight tuple
+			 * lock below, but the locker holds that until commit, so waiting
+			 * on the xid is equivalent and gives the deadlock detector the
+			 * same edge).
+			 */
+			if (TransactionIdIsCurrentTransactionId(xmax))
+				break;
+			if (TransactionIdIsInProgress(xmax))
+			{
+				UnlockReleaseBuffer(buf);
+
+				if (!wait)
+					return TM_WouldBlock;
+
+				XactLockTableWait(xmax, rel, tid, XLTW_Lock);
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			/* locker committed or aborted: the row is live either way */
 			break;
 		}
 
@@ -352,11 +408,31 @@ cs_delta_delete(Relation rel, ItemPointer tid, CommandId cid,
 	if (TransactionIdIsValid(xmax) &&
 		!(htup->t_infomask & HEAP_XMAX_INVALID))
 	{
-		/*
-		 * Another deleter slipped in between our check and taking the tuple
-		 * lock.  Same classification as above; an aborted xmax falls through
-		 * and is overwritten.
-		 */
+		if (htup->t_infomask & HEAP_XMAX_LOCK_ONLY)
+		{
+			/* see the first lock-only check above */
+			if (!TransactionIdIsCurrentTransactionId(xmax) &&
+				TransactionIdIsInProgress(xmax))
+			{
+				UnlockReleaseBuffer(buf);
+				UnlockTuple(rel, tid, AccessExclusiveLock);
+
+				if (!wait)
+					return TM_WouldBlock;
+
+				XactLockTableWait(xmax, rel, tid, XLTW_Lock);
+				CHECK_FOR_INTERRUPTS();
+				return cs_delta_delete(rel, tid, cid, xid, wait, tmfd);
+			}
+			/* own, committed, or aborted lock: overwrite below */
+		}
+		else
+
+			/*
+			 * Another deleter slipped in between our check and taking the
+			 * tuple lock.  Same classification as above; an aborted xmax
+			 * falls through and is overwritten.
+			 */
 		if (TransactionIdIsCurrentTransactionId(xmax))
 		{
 			tmfd->cmax = HeapTupleHeaderGetCmax(htup);
@@ -421,16 +497,564 @@ cs_delta_delete(Relation rel, ItemPointer tid, CommandId cid,
 	return TM_Ok;
 }
 
+/*
+ * Scan delta pages for a tombstone targeting the given virtual TID.
+ *
+ * Returns the xmin of the tombstone if found, InvalidTransactionId otherwise.
+ * Skips tombstones with aborted xmin.
+ */
+static TransactionId
+cs_find_tombstone_for_tid(Relation rel, CSMetaPageData *meta,
+						  ItemPointer target_tid, CommandId *tomb_cmin)
+{
+	BlockNumber blkno;
+	BlockNumber end_blk;
+
+	if (meta->cs_delta_nblocks == 0)
+		return InvalidTransactionId;
+
+	end_blk = meta->cs_delta_start + meta->cs_delta_nblocks;
+	for (blkno = meta->cs_delta_start; blkno < end_blk; blkno++)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber off;
+
+		buf = ReadBuffer(rel, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!CSPageIsDelta(page))
+		{
+			/* foreign page interleaved into the delta range; skip */
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+		maxoff = PageGetMaxOffsetNumber(page);
+
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			ItemId		itemid;
+			HeapTupleHeader htup;
+			TransactionId xmin;
+
+			itemid = PageGetItemId(page, off);
+			if (!ItemIdIsNormal(itemid))
+				continue;
+
+			htup = (HeapTupleHeader) PageGetItem(page, itemid);
+			if (!CS_IS_TOMBSTONE(htup))
+				continue;
+
+			/* row locks are not deletes */
+			if (CS_TOMBSTONE_IS_LOCK_ONLY(htup))
+				continue;
+
+			/* Check if this tombstone targets our TID */
+			if (!ItemPointerEquals(&htup->t_ctid, target_tid))
+				continue;
+
+			xmin = HeapTupleHeaderGetRawXmin(htup);
+
+			/* Skip aborted tombstones */
+			if (TransactionIdDidAbort(xmin))
+				continue;
+
+			/*
+			 * Report the deleting command id too: a caller hitting its own
+			 * tombstone needs it to distinguish "deleted earlier in this
+			 * command" from "deleted by an earlier command".
+			 */
+			if (tomb_cmin)
+				*tomb_cmin = HeapTupleHeaderGetRawCommandId(htup);
+
+			UnlockReleaseBuffer(buf);
+			return xmin;
+		}
+
+		UnlockReleaseBuffer(buf);
+	}
+
+	return InvalidTransactionId;
+}
+
+/*
+ * Check whether a visible tombstone exists for the given columnar virtual TID.
+ *
+ * Scans delta pages for tombstone tuples targeting target_tid and checks
+ * their visibility against the given snapshot.  Returns true if at least
+ * one visible tombstone is found, meaning the row should be treated as
+ * deleted from this snapshot's perspective.
+ */
+static bool
+cs_has_visible_tombstone(Relation rel, CSMetaPageData *meta,
+						 ItemPointer target_tid, Snapshot snapshot)
+{
+	BlockNumber blkno;
+	BlockNumber end_blk;
+
+	if (meta->cs_delta_nblocks == 0)
+		return false;
+
+	end_blk = meta->cs_delta_start + meta->cs_delta_nblocks;
+	for (blkno = meta->cs_delta_start; blkno < end_blk; blkno++)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber off;
+
+		buf = ReadBuffer(rel, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!CSPageIsDelta(page))
+		{
+			/* foreign page interleaved into the delta range; skip */
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+		maxoff = PageGetMaxOffsetNumber(page);
+
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			ItemId		itemid;
+			HeapTupleHeader htup;
+			HeapTupleData tuple;
+
+			itemid = PageGetItemId(page, off);
+			if (!ItemIdIsNormal(itemid))
+				continue;
+
+			htup = (HeapTupleHeader) PageGetItem(page, itemid);
+			if (!CS_IS_TOMBSTONE(htup))
+				continue;
+
+			/* row locks are not deletes */
+			if (CS_TOMBSTONE_IS_LOCK_ONLY(htup))
+				continue;
+
+			if (!ItemPointerEquals(&htup->t_ctid, target_tid))
+				continue;
+
+			/* Check visibility against snapshot */
+			tuple.t_data = htup;
+			tuple.t_len = ItemIdGetLength(itemid);
+			tuple.t_tableOid = RelationGetRelid(rel);
+			ItemPointerSet(&tuple.t_self, blkno, off);
+
+			if (cs_delta_satisfies_visibility(&tuple, snapshot))
+			{
+				UnlockReleaseBuffer(buf);
+				return true;
+			}
+		}
+
+		UnlockReleaseBuffer(buf);
+	}
+
+	return false;
+}
+
+/*
+ * Scan delta pages for a live lock-only tombstone on the given virtual
+ * TID held by another transaction.
+ *
+ * Returns the locker's xid (for the caller to wait on) and, via
+ * *lock_infomask, the lock-mode bits of that tombstone.  Spent lock
+ * tombstones (transaction ended) and our own are ignored; our own lock
+ * never conflicts with our own operations.
+ */
+static TransactionId
+cs_find_lock_tombstone_for_tid(Relation rel, CSMetaPageData *meta,
+							   ItemPointer target_tid, uint16 *lock_infomask)
+{
+	BlockNumber blkno;
+	BlockNumber end_blk;
+
+	if (meta->cs_delta_nblocks == 0)
+		return InvalidTransactionId;
+
+	end_blk = meta->cs_delta_start + meta->cs_delta_nblocks;
+	for (blkno = meta->cs_delta_start; blkno < end_blk; blkno++)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber off;
+
+		buf = ReadBuffer(rel, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!CSPageIsDelta(page))
+		{
+			/* foreign page interleaved into the delta range; skip */
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+		maxoff = PageGetMaxOffsetNumber(page);
+
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			ItemId		itemid;
+			HeapTupleHeader htup;
+			TransactionId xmin;
+
+			itemid = PageGetItemId(page, off);
+			if (!ItemIdIsNormal(itemid))
+				continue;
+
+			htup = (HeapTupleHeader) PageGetItem(page, itemid);
+			if (!CS_IS_TOMBSTONE(htup) || !CS_TOMBSTONE_IS_LOCK_ONLY(htup))
+				continue;
+
+			if (!ItemPointerEquals(&htup->t_ctid, target_tid))
+				continue;
+
+			xmin = HeapTupleHeaderGetRawXmin(htup);
+			if (!TransactionIdIsValid(xmin) ||
+				TransactionIdIsCurrentTransactionId(xmin))
+				continue;
+
+			/* in-progress before committed; see xact.c on the ordering */
+			if (TransactionIdIsInProgress(xmin))
+			{
+				if (lock_infomask)
+					*lock_infomask = htup->t_infomask;
+				UnlockReleaseBuffer(buf);
+				return xmin;
+			}
+
+			/* transaction ended: the lock is spent */
+		}
+
+		UnlockReleaseBuffer(buf);
+	}
+
+	return InvalidTransactionId;
+}
+
+/*
+ * Collect all visible tombstones into an index fetch descriptor.
+ *
+ * This mirrors cs_collect_tombstones() in cs_scan.c but operates on the
+ * CSIndexFetchData rather than CScanDesc.
+ */
+static void
+cs_collect_tombstones_for_index(CSIndexFetchData *cscan, Relation rel,
+								CSMetaPageData *meta, Snapshot snapshot)
+{
+	/* arrays must outlive any per-row context we may be called from */
+	MemoryContext oldcxt = MemoryContextSwitchTo(cscan->rg_cache_parent);
+
+	BlockNumber blkno;
+	BlockNumber end_blk;
+	ItemPointerData *tids = NULL;
+	int			count = 0;
+	int			capacity = 0;
+
+	cscan->tombstones_collected = true;
+	cscan->tombstone_count = 0;
+	cscan->tombstone_tids = NULL;
+
+	if (meta->cs_delta_nblocks == 0)
+	{
+		MemoryContextSwitchTo(oldcxt);
+		return;
+	}
+
+	end_blk = meta->cs_delta_start + meta->cs_delta_nblocks;
+
+	for (blkno = meta->cs_delta_start; blkno < end_blk; blkno++)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber off;
+
+		buf = ReadBuffer(rel, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!CSPageIsDelta(page))
+		{
+			/* foreign page interleaved into the delta range; skip */
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+		maxoff = PageGetMaxOffsetNumber(page);
+
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			ItemId		itemid;
+			HeapTupleHeader htup;
+			HeapTupleData tuple;
+
+			itemid = PageGetItemId(page, off);
+			if (!ItemIdIsNormal(itemid))
+				continue;
+
+			htup = (HeapTupleHeader) PageGetItem(page, itemid);
+			if (!CS_IS_TOMBSTONE(htup))
+				continue;
+
+			/* row locks are not deletes */
+			if (CS_TOMBSTONE_IS_LOCK_ONLY(htup))
+				continue;
+
+			tuple.t_data = htup;
+			tuple.t_len = ItemIdGetLength(itemid);
+			tuple.t_tableOid = RelationGetRelid(rel);
+			ItemPointerSet(&tuple.t_self, blkno, off);
+
+			if (!cs_delta_satisfies_visibility(&tuple, snapshot))
+				continue;
+
+			if (count >= capacity)
+			{
+				if (capacity == 0)
+				{
+					capacity = 32;
+					tids = palloc_array(ItemPointerData, capacity);
+				}
+				else
+				{
+					capacity *= 2;
+					tids = repalloc_array(tids, ItemPointerData, capacity);
+				}
+			}
+			tids[count++] = htup->t_ctid;
+		}
+
+		UnlockReleaseBuffer(buf);
+	}
+
+	if (count > 1)
+	{
+		qsort(tids, count, sizeof(ItemPointerData),
+			  (int (*) (const void *, const void *)) ItemPointerCompare);
+	}
+
+	cscan->tombstone_tids = tids;
+	cscan->tombstone_count = count;
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * Delete a columnar row by inserting a tombstone into the delta store.
+ *
+ * The tombstone is a minimal heap tuple with MVCC headers; its t_ctid
+ * points to the target columnar virtual TID.  Scans check tombstone
+ * visibility via HeapTupleSatisfiesVisibility, and VACUUM materializes
+ * committed tombstones into the deletion bitmap.
+ *
+ * Acquires a heavyweight tuple lock for conflict detection.  If 'wait' is
+ * true, blocks on a conflicting locker; otherwise returns TM_WouldBlock.
+ */
+static TM_Result
+cs_columnar_delete(Relation rel, ItemPointer tid, CommandId cid,
+				   bool wait, TM_FailureData *tmfd)
+{
+	BlockNumber blkno = ItemPointerGetBlockNumber(tid);
+	OffsetNumber offnum = ItemPointerGetOffsetNumber(tid);
+	uint32		rg_id;
+	uint32		row_offset;
+	CSMetaPageData meta;
+	CSRowGroupDesc *rg_desc;
+	Size		rg_size;
+	BlockNumber rg_catalog_block;
+	TransactionId tombstone_xmin;
+	CommandId	tomb_cmin = InvalidCommandId;
+
+	/* Decode virtual TID to (rg_id, row_offset) */
+	rg_id = (blkno - CS_COLUMNAR_BLKNO_BASE) / CS_VIRTUAL_BLOCKS_PER_RG;
+	row_offset = ((blkno - CS_COLUMNAR_BLKNO_BASE) % CS_VIRTUAL_BLOCKS_PER_RG)
+		* CS_ROWS_PER_VIRTUAL_BLOCK + (offnum - 1);
+
+retry:
+	cs_read_metapage(rel, &meta);
+
+	if (rg_id >= meta.cs_nrowgroups)
+		return TM_Invisible;
+
+	/* Read directory to find catalog block for this row group */
+	{
+		BlockNumber *rgdir = cs_read_rgdir(rel, &meta);
+
+		if (rgdir == NULL)
+			return TM_Invisible;
+		rg_catalog_block = rgdir[rg_id];
+		pfree(rgdir);
+	}
+	if (rg_catalog_block == InvalidBlockNumber)
+		return TM_Invisible;
+
+	/* Read the row group catalog entry */
+	rg_size = CSRowGroupDescSize(meta.cs_natts);
+	rg_desc = palloc(rg_size);
+	cs_read_rowgroup_catalog(rel, rg_catalog_block, rg_desc, meta.cs_natts);
+
+	if (row_offset >= rg_desc->rg_num_rows)
+	{
+		pfree(rg_desc);
+		return TM_Invisible;
+	}
+
+	/*
+	 * If already deleted, report TM_Deleted (no update chains; see
+	 * cs_delta_delete)
+	 */
+	if (rg_desc->rg_delbitmap_block != InvalidBlockNumber)
+	{
+		if (cs_delbitmap_test_bit(rel, rg_desc->rg_delbitmap_block,
+								  row_offset))
+		{
+			pfree(rg_desc);
+			ItemPointerCopy(tid, &tmfd->ctid);
+			tmfd->xmax = InvalidTransactionId;
+			tmfd->cmax = InvalidCommandId;
+			return TM_Deleted;
+		}
+	}
+
+	pfree(rg_desc);
+
+	/* Acquire heavyweight tuple lock for conflict detection */
+	if (wait)
+		LockTuple(rel, tid, AccessExclusiveLock);
+	else
+	{
+		if (!ConditionalLockTuple(rel, tid, AccessExclusiveLock, false))
+			return TM_WouldBlock;
+	}
+
+	/*
+	 * Re-read metapage and re-check bitmap after lock — VACUUM may have
+	 * materialized tombstones and set bitmap bits while we waited.
+	 */
+	cs_read_metapage(rel, &meta);
+	rg_desc = palloc(CSRowGroupDescSize(meta.cs_natts));
+	cs_read_rowgroup_catalog(rel, rg_catalog_block, rg_desc, meta.cs_natts);
+
+	if (rg_desc->rg_delbitmap_block != InvalidBlockNumber)
+	{
+		if (cs_delbitmap_test_bit(rel, rg_desc->rg_delbitmap_block,
+								  row_offset))
+		{
+			pfree(rg_desc);
+			UnlockTuple(rel, tid, AccessExclusiveLock);
+			ItemPointerCopy(tid, &tmfd->ctid);
+			tmfd->xmax = InvalidTransactionId;
+			tmfd->cmax = InvalidCommandId;
+			return TM_Deleted;
+		}
+	}
+	pfree(rg_desc);
+
+	/* Check for existing tombstone targeting this TID */
+	tombstone_xmin = cs_find_tombstone_for_tid(rel, &meta, tid, &tomb_cmin);
+
+	if (TransactionIdIsValid(tombstone_xmin))
+	{
+		UnlockTuple(rel, tid, AccessExclusiveLock);
+
+		if (TransactionIdIsCurrentTransactionId(tombstone_xmin))
+		{
+			ItemPointerCopy(tid, &tmfd->ctid);
+			tmfd->xmax = tombstone_xmin;
+
+			/*
+			 * The deleting command id lets ExecDelete tell a legitimate
+			 * duplicate hit (same row joined twice, earlier command) from
+			 * self-modification within the current command, which must raise
+			 * an error rather than be skipped.
+			 */
+			tmfd->cmax = tomb_cmin;
+			return TM_SelfModified;
+		}
+
+		if (TransactionIdDidCommit(tombstone_xmin))
+		{
+			ItemPointerCopy(tid, &tmfd->ctid);
+			tmfd->xmax = tombstone_xmin;
+			tmfd->cmax = InvalidCommandId;
+			return TM_Deleted;
+		}
+
+		/*
+		 * Tombstone from in-progress transaction.  This shouldn't normally
+		 * happen because we hold the tuple lock, but handle it by waiting for
+		 * the other transaction and retrying.
+		 */
+		if (!wait)
+			return TM_WouldBlock;
+
+		XactLockTableWait(tombstone_xmin, rel, tid, XLTW_Delete);
+		goto retry;
+	}
+
+	/*
+	 * A live row lock (lock-only tombstone) from another transaction blocks
+	 * the delete until that transaction ends, like a lock-only xmax does on a
+	 * delta row.
+	 */
+	{
+		TransactionId locker;
+
+		locker = cs_find_lock_tombstone_for_tid(rel, &meta, tid, NULL);
+		if (TransactionIdIsValid(locker))
+		{
+			UnlockTuple(rel, tid, AccessExclusiveLock);
+
+			if (!wait)
+				return TM_WouldBlock;
+
+			XactLockTableWait(locker, rel, tid, XLTW_Delete);
+			CHECK_FOR_INTERRUPTS();
+			goto retry;
+		}
+	}
+
+	/* Insert tombstone into the delta store */
+	cs_delta_insert_tombstone(rel, tid, 0);
+
+	UnlockTuple(rel, tid, AccessExclusiveLock);
+
+	return TM_Ok;
+}
+
 static TM_Result
 cs_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 				uint32 options, Snapshot snapshot, Snapshot crosscheck,
 				bool wait, TM_FailureData *tmfd)
 {
-	if (ItemPointerGetBlockNumber(tid) >= CS_COLUMNAR_BLKNO_BASE)
-		elog(ERROR, "columnstore: columnar DELETE not yet supported");
+	BlockNumber blkno = ItemPointerGetBlockNumber(tid);
 
-	return cs_delta_delete(rel, tid, cid, GetCurrentTransactionId(),
-						   wait, tmfd);
+	/*
+	 * Crosscheck snapshot (heap_delete equivalent): a referential action
+	 * cascading under REPEATABLE READ must fail with a serialization error
+	 * when the row is not visible to the transaction snapshot, even though
+	 * its latest version is deletable.
+	 */
+	if (crosscheck != InvalidSnapshot)
+	{
+		TupleTableSlot *cslot = table_slot_create(rel, NULL);
+		bool		visible;
+
+		visible = cs_fetch_row_version(rel, tid, crosscheck, cslot);
+		ExecDropSingleTupleTableSlot(cslot);
+		if (!visible)
+		{
+			ItemPointerCopy(tid, &tmfd->ctid);
+			tmfd->xmax = InvalidTransactionId;
+			tmfd->cmax = InvalidCommandId;
+			return TM_Updated;
+		}
+	}
+
+	if (blkno >= CS_COLUMNAR_BLKNO_BASE)
+		return cs_columnar_delete(rel, tid, cid, wait, tmfd);
+	else
+		return cs_delta_delete(rel, tid, cid, GetCurrentTransactionId(),
+							   wait, tmfd);
 }
 
 static TM_Result
@@ -454,36 +1078,444 @@ cs_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 	return TM_Ok;
 }
 
+/*
+ * Heavyweight lock mode for each tuple lock mode; the same mapping heap
+ * uses (tupleLockExtraInfo), so the conflict matrix matches heap's tuple
+ * lock semantics: key-share vs no-key-exclusive are compatible, share vs
+ * exclusive conflict, and so on.
+ */
+static const LOCKMODE cs_tuplelock_hwlock[] = {
+	[LockTupleKeyShare] = AccessShareLock,
+	[LockTupleShare] = RowShareLock,
+	[LockTupleNoKeyExclusive] = ExclusiveLock,
+	[LockTupleExclusive] = AccessExclusiveLock,
+};
+
+/*
+ * Lock a tuple, for SELECT FOR UPDATE/SHARE, EvalPlanQual, and the RI
+ * trigger machinery.
+ *
+ * The lock is recorded durably in row state, as heap does: a delta row
+ * gets a lock-only xmax stamped (HEAP_XMAX_LOCK_ONLY plus mode bits),
+ * and a columnar row -- physically immutable -- gets a lock-only
+ * tombstone in the delta carrying the locker's xid and mode.  Writers
+ * find the record and wait on the locker's xid; the heavyweight tuple
+ * lock below is only held transiently to serialize check-and-record,
+ * mirroring heap_lock_tuple.  With a single xmax and no multixact
+ * support, a delta row records one live locker at a time: concurrent
+ * holders of compatible modes (e.g. two FOR KEY SHARE) serialize where
+ * heap's would not (see README).
+ *
+ * There are no update chains (UPDATE is delete + insert at an unrelated
+ * TID), so tmfd->traversed is always false and a committed deleter
+ * yields TM_Deleted, never a followable TM_Updated.
+ */
 static TM_Result
 cs_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 			  TupleTableSlot *slot, CommandId cid, LockTupleMode mode,
 			  LockWaitPolicy wait_policy, uint8 flags,
 			  TM_FailureData *tmfd)
 {
+	ItemPointerData tid_copy;
 	BlockNumber blkno = ItemPointerGetBlockNumber(tid);
+	LOCKMODE	hwlock = cs_tuplelock_hwlock[mode];
+	TM_Result	result;
+
+	/*
+	 * Callers may pass a pointer into the very slot we are asked to fill
+	 * (ri_LockPKTuple passes &slot->tts_tid), and our fetch paths clear the
+	 * slot before storing into it; work from a copy.
+	 */
+	tid_copy = *tid;
+	tid = &tid_copy;
+
+	tmfd->traversed = false;
+
+	/* Acquire the heavyweight tuple lock per the caller's wait policy */
+	switch (wait_policy)
+	{
+		case LockWaitBlock:
+			LockTuple(rel, tid, hwlock);
+			break;
+		case LockWaitSkip:
+			if (!ConditionalLockTuple(rel, tid, hwlock, false))
+				return TM_WouldBlock;
+			break;
+		case LockWaitError:
+			if (!ConditionalLockTuple(rel, tid, hwlock, false))
+				ereport(ERROR,
+						(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+						 errmsg("could not obtain lock on row in relation \"%s\"",
+								RelationGetRelationName(rel))));
+			break;
+	}
 
 	if (blkno >= CS_COLUMNAR_BLKNO_BASE)
+		result = cs_columnar_lock_check(rel, tid, slot, mode, wait_policy,
+										tmfd);
+	else
+		result = cs_delta_lock_check(rel, tid, slot, cid, mode, wait_policy,
+									 tmfd);
+
+	/*
+	 * The heavyweight lock only serializes the check-and-record sequence (the
+	 * lock manager forbids holding tuple locks to transaction end); what
+	 * persists is the record it protected: a lock-only xmax on a delta row,
+	 * or a lock-only tombstone for a columnar row.
+	 */
+	UnlockTuple(rel, tid, hwlock);
+
+	return result;
+}
+
+/*
+ * Check the current state of a columnar row after the tuple lock has
+ * been acquired, and load it into the slot on success.
+ */
+static TM_Result
+cs_columnar_lock_check(Relation rel, ItemPointer tid, TupleTableSlot *slot,
+					   LockTupleMode mode, LockWaitPolicy wait_policy,
+					   TM_FailureData *tmfd)
+{
+	/* lock-only tombstone infomask bits per mode; see cs_delta_lock_check */
+	static const uint16 lockonly_infomask[] = {
+		[LockTupleKeyShare] = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK,
+		[LockTupleShare] = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_SHR_LOCK,
+		[LockTupleNoKeyExclusive] = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK,
+		[LockTupleExclusive] = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK,
+	};
+
+	for (;;)
 	{
-		/*
-		 * Columnar rows are immutable — updates are implemented as delete +
-		 * insert into delta.  To "lock" a columnar row, just verify it hasn't
-		 * been deleted and fetch it into the slot.
-		 */
-		if (!cs_fetch_row_version(rel, tid, snapshot, slot))
+		CSMetaPageData meta;
+		BlockNumber blkno = ItemPointerGetBlockNumber(tid);
+		OffsetNumber offnum = ItemPointerGetOffsetNumber(tid);
+		uint32		rg_id;
+		uint32		row_offset;
+		BlockNumber rg_catalog_block;
+		CSRowGroupDesc *rg_desc;
+		TransactionId tombstone_xmin;
+		CommandId	tomb_cmin = InvalidCommandId;
+
+		CHECK_FOR_INTERRUPTS();
+
+		rg_id = (blkno - CS_COLUMNAR_BLKNO_BASE) / CS_VIRTUAL_BLOCKS_PER_RG;
+		row_offset = ((blkno - CS_COLUMNAR_BLKNO_BASE) % CS_VIRTUAL_BLOCKS_PER_RG)
+			* CS_ROWS_PER_VIRTUAL_BLOCK + (offnum - 1);
+
+		cs_read_metapage(rel, &meta);
+
+		if (rg_id >= meta.cs_nrowgroups)
+			return TM_Invisible;
+
+		{
+			BlockNumber *rgdir = cs_read_rgdir(rel, &meta);
+
+			if (rgdir == NULL)
+				return TM_Invisible;
+			rg_catalog_block = rgdir[rg_id];
+			pfree(rgdir);
+		}
+		if (rg_catalog_block == InvalidBlockNumber)
+			return TM_Invisible;
+
+		rg_desc = palloc(CSRowGroupDescSize(meta.cs_natts));
+		cs_read_rowgroup_catalog(rel, rg_catalog_block, rg_desc,
+								 meta.cs_natts);
+
+		if (row_offset >= rg_desc->rg_num_rows)
+		{
+			pfree(rg_desc);
+			return TM_Invisible;
+		}
+
+		/* Materialized delete? */
+		if (rg_desc->rg_delbitmap_block != InvalidBlockNumber &&
+			cs_delbitmap_test_bit(rel, rg_desc->rg_delbitmap_block,
+								  row_offset))
+		{
+			pfree(rg_desc);
+			ItemPointerCopy(tid, &tmfd->ctid);
+			tmfd->xmax = InvalidTransactionId;
+			tmfd->cmax = InvalidCommandId;
 			return TM_Deleted;
+		}
+		pfree(rg_desc);
+
+		/* Pending (tombstoned) delete? */
+		tombstone_xmin = cs_find_tombstone_for_tid(rel, &meta, tid,
+												   &tomb_cmin);
+		if (TransactionIdIsValid(tombstone_xmin))
+		{
+			if (TransactionIdIsCurrentTransactionId(tombstone_xmin))
+			{
+				ItemPointerCopy(tid, &tmfd->ctid);
+				tmfd->xmax = tombstone_xmin;
+				tmfd->cmax = tomb_cmin;
+				return TM_SelfModified;
+			}
+
+			if (TransactionIdDidCommit(tombstone_xmin))
+			{
+				ItemPointerCopy(tid, &tmfd->ctid);
+				tmfd->xmax = tombstone_xmin;
+				tmfd->cmax = InvalidCommandId;
+				return TM_Deleted;
+			}
+
+			/*
+			 * In-progress deleter.  It inserted its tombstone before we
+			 * acquired the tuple lock (deleters do not hold the tuple lock
+			 * while their transaction idles).  Wait it out per the caller's
+			 * policy, then re-check.
+			 */
+			if (TransactionIdIsInProgress(tombstone_xmin))
+			{
+				if (wait_policy == LockWaitSkip)
+					return TM_WouldBlock;
+				if (wait_policy == LockWaitError)
+					ereport(ERROR,
+							(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+							 errmsg("could not obtain lock on row in relation \"%s\"",
+									RelationGetRelationName(rel))));
+				XactLockTableWait(tombstone_xmin, rel, tid, XLTW_Lock);
+				continue;
+			}
+
+			/* aborted deleter: the row is live, fall through */
+		}
+
+		/*
+		 * Another transaction's live row lock blocks us unless both locks are
+		 * key-shares (the only compatible pairing we can recognize: an EXCL
+		 * bit may mean either exclusive mode, so it is treated as conflicting
+		 * with everything but is compatible with nothing).
+		 */
+		{
+			uint16		their_mask = 0;
+			TransactionId locker;
+
+			locker = cs_find_lock_tombstone_for_tid(rel, &meta, tid,
+													&their_mask);
+			if (TransactionIdIsValid(locker) &&
+				!(mode == LockTupleKeyShare &&
+				  (their_mask & HEAP_XMAX_SHR_LOCK) == HEAP_XMAX_KEYSHR_LOCK))
+			{
+				if (wait_policy == LockWaitSkip)
+					return TM_WouldBlock;
+				if (wait_policy == LockWaitError)
+					ereport(ERROR,
+							(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+							 errmsg("could not obtain lock on row in relation \"%s\"",
+									RelationGetRelationName(rel))));
+				XactLockTableWait(locker, rel, tid, XLTW_Lock);
+				continue;
+			}
+		}
+
+		/*
+		 * Record the lock as a lock-only tombstone so it survives the
+		 * transient heavyweight lock: deleters and conflicting lockers find
+		 * it and wait on our xid, and compaction retains the page holding it
+		 * until we finish.
+		 */
+		cs_delta_insert_tombstone(rel, tid, lockonly_infomask[mode]);
+
+		/*
+		 * Row is live.  Load it via SnapshotAny: visibility against the
+		 * caller's snapshot is the executor's business (e.g. ON CONFLICT DO
+		 * UPDATE locks rows its snapshot cannot see and then raises the
+		 * serialization error itself); the lock layer reports the current
+		 * version, exactly as heap_lock_tuple does.
+		 */
+		if (!cs_fetch_row_version(rel, tid, SnapshotAny, slot))
+			return TM_Invisible;
 
 		return TM_Ok;
 	}
-	else
-	{
-		/*
-		 * Delta store row: use heavyweight tuple locking analogous to the
-		 * delete path.  We re-fetch the tuple under lock.
-		 */
-		if (!cs_fetch_row_version(rel, tid, snapshot, slot))
-			return TM_Deleted;
+}
 
-		return TM_Ok;
+/*
+ * Check the current state of a delta-store row after the tuple lock has
+ * been acquired, and load it into the slot on success.
+ *
+ * Delta tuples are heap-format, so HeapTupleSatisfiesUpdate provides
+ * the classification (without hint-bit maintenance: see the
+ * NoHintBitsBuffer note at the call site).
+ */
+static TM_Result
+cs_delta_lock_check(Relation rel, ItemPointer tid, TupleTableSlot *slot,
+					CommandId cid, LockTupleMode mode,
+					LockWaitPolicy wait_policy, TM_FailureData *tmfd)
+{
+	/* lock-only xmax infomask bits per lock mode, as heap sets them */
+	static const uint16 lockonly_infomask[] = {
+		[LockTupleKeyShare] = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK,
+		[LockTupleShare] = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_SHR_LOCK,
+		[LockTupleNoKeyExclusive] = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK,
+		[LockTupleExclusive] = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK,
+	};
+
+	for (;;)
+	{
+		Buffer		buf;
+		Page		page;
+		ItemId		itemid;
+		HeapTupleData tuple;
+		TM_Result	htsu;
+		TransactionId xmax;
+		GenericXLogState *state;
+		HeapTupleHeader htup;
+
+		CHECK_FOR_INTERRUPTS();
+
+		buf = ReadBuffer(rel, ItemPointerGetBlockNumber(tid));
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+
+		/* a foreign page interleaved into the range is not delta content */
+		if (!CSPageIsDelta(page))
+		{
+			UnlockReleaseBuffer(buf);
+			return TM_Invisible;
+		}
+
+		/*
+		 * A fenced page is being moved to columnar by a running compaction;
+		 * an xmax stamped now would be discarded with the page.  Wait for the
+		 * compaction and re-evaluate (the row either moved -- gone from this
+		 * TID -- or the batch was discarded). See the same dance in
+		 * cs_delta_delete.
+		 */
+		if (CSDeltaPageIsFenced(page))
+		{
+			CSMetaPageData fmeta;
+			BlockNumber blkno = ItemPointerGetBlockNumber(tid);
+
+			UnlockReleaseBuffer(buf);
+
+			if (wait_policy == LockWaitSkip)
+				return TM_WouldBlock;
+			if (wait_policy == LockWaitError)
+				ereport(ERROR,
+						(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+						 errmsg("could not obtain lock on row in relation \"%s\"",
+								RelationGetRelationName(rel))));
+
+			LockPage(rel, CS_METAPAGE_BLKNO, ShareLock);
+			UnlockPage(rel, CS_METAPAGE_BLKNO, ShareLock);
+
+			cs_read_metapage(rel, &fmeta);
+			if (fmeta.cs_delta_nblocks == 0 ||
+				blkno < fmeta.cs_delta_start ||
+				blkno >= fmeta.cs_delta_start + fmeta.cs_delta_nblocks)
+			{
+				tmfd->xmax = InvalidTransactionId;
+				tmfd->cmax = InvalidCommandId;
+				ItemPointerCopy(tid, &tmfd->ctid);
+				return TM_Deleted;
+			}
+			continue;
+		}
+
+		itemid = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
+		if (!ItemIdIsNormal(itemid))
+		{
+			UnlockReleaseBuffer(buf);
+			return TM_Invisible;
+		}
+
+		tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
+		tuple.t_len = ItemIdGetLength(itemid);
+		tuple.t_tableOid = RelationGetRelid(rel);
+		ItemPointerCopy(tid, &tuple.t_self);
+
+		/*
+		 * NoHintBitsBuffer: delta pages are modified exclusively through
+		 * generic WAL, and the generic rmgr has no masking function, so an
+		 * unlogged hint-bit write here would make subsequent WAL records for
+		 * this page fail consistency checking on replay (and recovery itself
+		 * with wal_consistency_checking enabled).
+		 */
+		htsu = HeapTupleSatisfiesUpdate(&tuple, cid, NoHintBitsBuffer);
+		xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+
+		switch (htsu)
+		{
+			case TM_Ok:
+
+				/*
+				 * Stamp a lock-only xmax so that compaction's tuple
+				 * classifier sees the row as pinned and will not move it to
+				 * columnar (which would detach it from this lock's TID).  A
+				 * previous lock whose transaction has ended is overwritten;
+				 * t_cid is left alone so a tuple we inserted ourselves keeps
+				 * its cmin for cursor visibility.  With a single xmax and no
+				 * multixact support, only one live locker can be recorded:
+				 * SatisfiesUpdate reports any other live locker as
+				 * TM_BeingModified and we wait, so compatible lock modes
+				 * serialize more than heap's would (documented in the
+				 * README).
+				 */
+				state = GenericXLogStart(rel);
+				page = GenericXLogRegisterBuffer(state, buf, 0);
+				itemid = PageGetItemId(page,
+									   ItemPointerGetOffsetNumber(tid));
+				htup = (HeapTupleHeader) PageGetItem(page, itemid);
+				htup->t_infomask &= ~(HEAP_XMAX_COMMITTED |
+									  HEAP_XMAX_INVALID |
+									  HEAP_XMAX_IS_MULTI |
+									  HEAP_XMAX_LOCK_ONLY |
+									  HEAP_XMAX_KEYSHR_LOCK |
+									  HEAP_XMAX_EXCL_LOCK);
+				htup->t_infomask |= lockonly_infomask[mode];
+				HeapTupleHeaderSetXmax(htup, GetCurrentTransactionId());
+				GenericXLogFinish(state);
+				UnlockReleaseBuffer(buf);
+
+				/* see cs_columnar_lock_check on SnapshotAny */
+				if (!cs_fetch_row_version(rel, tid, SnapshotAny, slot))
+					return TM_Invisible;
+				return TM_Ok;
+
+			case TM_SelfModified:
+				tmfd->cmax = HeapTupleHeaderGetCmax(tuple.t_data);
+				tmfd->xmax = xmax;
+				ItemPointerCopy(tid, &tmfd->ctid);
+				UnlockReleaseBuffer(buf);
+				return TM_SelfModified;
+
+			case TM_Invisible:
+				UnlockReleaseBuffer(buf);
+				return TM_Invisible;
+
+			case TM_BeingModified:
+				UnlockReleaseBuffer(buf);
+
+				if (wait_policy == LockWaitSkip)
+					return TM_WouldBlock;
+				if (wait_policy == LockWaitError)
+					ereport(ERROR,
+							(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+							 errmsg("could not obtain lock on row in relation \"%s\"",
+									RelationGetRelationName(rel))));
+				XactLockTableWait(xmax, rel, tid, XLTW_Lock);
+				continue;
+
+			case TM_Updated:
+			case TM_Deleted:
+				/* no update chains; see cs_delta_delete */
+				tmfd->xmax = xmax;
+				tmfd->cmax = InvalidCommandId;
+				ItemPointerCopy(tid, &tmfd->ctid);
+				UnlockReleaseBuffer(buf);
+				return TM_Deleted;
+
+			default:
+				UnlockReleaseBuffer(buf);
+				elog(ERROR, "unexpected HeapTupleSatisfiesUpdate result: %d",
+					 (int) htsu);
+		}
 	}
 }
 
@@ -491,13 +1523,12 @@ cs_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
  * Tuple visibility callbacks
  * ----------------------------------------------------------------
  */
-
 /*
- * Fetch all columns of a single columnar row through a private column cache.
+ * Fetch a single row from a columnar row group.
  *
- * Reads the row group catalog and decompresses each column to extract the
- * value at row_offset.  Used by single-row index fetch / EvalPlanQual paths
- * where we don't have a scan descriptor with a persistent cache.
+ * Uses cs_load_rowgroup_into + cs_ensure_column_loaded to handle all
+ * encoding layers (NI64, FOR, DICT, base compression).  The loaded
+ * column cache is freed before returning.
  */
 static void
 cs_fetch_columnar_row(Relation rel, BlockNumber rg_catalog_block,
@@ -666,6 +1697,16 @@ cs_fetch_row_version(Relation rel, ItemPointer tid,
 
 		pfree(rg_desc);
 
+		/*
+		 * Check for visible tombstones (pending MVCC deletes).  SnapshotAny
+		 * callers (AFTER ROW trigger and RI refetches) must see the row
+		 * regardless of any delete, exactly as the delta branch below exempts
+		 * SnapshotAny from its visibility test.
+		 */
+		if (snapshot->snapshot_type != SNAPSHOT_ANY &&
+			cs_has_visible_tombstone(rel, &meta, tid, snapshot))
+			return false;
+
 		/* Fetch all columns for this row via the column cache */
 		cs_fetch_columnar_row(rel, rg_catalog_block, row_offset,
 							  tupdesc, slot->tts_values, slot->tts_isnull);
@@ -808,26 +1849,6 @@ cs_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
 	/* No bottom-up index deletion support yet */
 	return InvalidTransactionId;
-}
-
-/*
- * Collect all visible tombstones into an index fetch descriptor.
- *
- * Stub for step 4: columnar DELETE arrives in step 5, so there are no
- * tombstones to collect yet.  The real walk-the-delta-pages implementation
- * replaces this body in step 5.
- */
-static void
-cs_collect_tombstones_for_index(CSIndexFetchData *cscan, Relation rel,
-								CSMetaPageData *meta, Snapshot snapshot)
-{
-	/* arrays must outlive any per-row context we may be called from */
-	MemoryContext oldcxt = MemoryContextSwitchTo(cscan->rg_cache_parent);
-
-	cscan->tombstones_collected = true;
-	cscan->tombstone_count = 0;
-	cscan->tombstone_tids = NULL;
-	MemoryContextSwitchTo(oldcxt);
 }
 
 /* ----------------------------------------------------------------
@@ -1074,10 +2095,58 @@ cs_index_fetch_tuple(IndexFetchTableData *scan, ItemPointer tid,
 			}
 		}
 
-		/* Check for visible tombstones (pending MVCC deletes) */
-		if (cscan->tombstone_count > 0 &&
-			cs_tombstone_lookup(cscan->tombstone_tids,
-								cscan->tombstone_count, tid))
+		/*
+		 * Check for pending MVCC deletes (tombstones).
+		 *
+		 * SnapshotDirty callers (uniqueness checks) get the real dirty
+		 * contract: a row whose delete is still in progress is returned as
+		 * visible with snapshot->xmax announcing the deleter, so
+		 * _bt_check_unique waits for it instead of treating the row as
+		 * already gone (which would let a conflicting insert succeed and
+		 * leave two live rows if the delete then aborts).
+		 *
+		 * SnapshotAny callers (trigger/RI refetch) see the row no matter
+		 * what.  Everyone else consults the tombstones collected under the
+		 * scan snapshot.
+		 */
+		if (snapshot->snapshot_type == SNAPSHOT_DIRTY)
+		{
+			CSMetaPageData tomb_meta;
+			TransactionId tomb_xmin;
+
+			snapshot->xmin = InvalidTransactionId;
+			snapshot->xmax = InvalidTransactionId;
+			snapshot->speculativeToken = 0;
+
+			cs_read_metapage(rel, &tomb_meta);
+			tomb_xmin = cs_find_tombstone_for_tid(rel, &tomb_meta, tid, NULL);
+			if (TransactionIdIsValid(tomb_xmin))
+			{
+				if (TransactionIdIsCurrentTransactionId(tomb_xmin))
+				{
+					/* deleted by our own transaction */
+					if (all_dead)
+						*all_dead = false;
+					return false;
+				}
+				else if (TransactionIdIsInProgress(tomb_xmin))
+				{
+					/* pending delete: return the row, announce deleter */
+					snapshot->xmax = tomb_xmin;
+				}
+				else if (TransactionIdDidCommit(tomb_xmin))
+				{
+					if (all_dead)
+						*all_dead = false;
+					return false;
+				}
+				/* else: aborted delete, row is live */
+			}
+		}
+		else if (snapshot->snapshot_type != SNAPSHOT_ANY &&
+				 cscan->tombstone_count > 0 &&
+				 cs_tombstone_lookup(cscan->tombstone_tids,
+									 cscan->tombstone_count, tid))
 		{
 			if (all_dead)
 				*all_dead = false;
@@ -1098,18 +2167,6 @@ cs_index_fetch_tuple(IndexFetchTableData *scan, ItemPointer tid,
 
 		if (all_dead)
 			*all_dead = false;
-
-		/*
-		 * For SnapshotDirty callers (e.g. ON CONFLICT uniqueness checks),
-		 * clear the snapshot output fields.  Frozen columnar rows have no
-		 * in-progress xmin/xmax.
-		 */
-		if (snapshot->snapshot_type == SNAPSHOT_DIRTY)
-		{
-			snapshot->xmin = InvalidTransactionId;
-			snapshot->xmax = InvalidTransactionId;
-			snapshot->speculativeToken = 0;
-		}
 
 		slot->tts_nvalid = 0;
 		slot->tts_flags &= ~TTS_FLAG_EMPTY;
@@ -1439,6 +2496,10 @@ cs_scan_analyze_next_tuple(TableScanDesc scan, double *liverows,
 	 */
 	if (cscan->colcache.col_nrows > 0)
 	{
+		/* Collect tombstones lazily before first columnar row access */
+		if (!cscan->tombstones_collected)
+			cs_collect_tombstones(cscan);
+
 		while (cscan->cur_row_in_group < cscan->colcache.col_nrows)
 		{
 			uint32		row = cscan->cur_row_in_group++;
@@ -1449,6 +2510,20 @@ cs_scan_analyze_next_tuple(TableScanDesc scan, double *liverows,
 			{
 				*deadrows += 1;
 				continue;
+			}
+
+			/* Skip rows with visible tombstones (pending MVCC deletes) */
+			if (cscan->tombstone_count > 0)
+			{
+				ItemPointerData vtid;
+
+				cs_encode_virtual_tid(&vtid, cscan->cur_rowgroup, row);
+				if (cs_tombstone_lookup(cscan->tombstone_tids,
+										cscan->tombstone_count, &vtid))
+				{
+					*deadrows += 1;
+					continue;
+				}
 			}
 
 			*liverows += 1;
@@ -1822,6 +2897,8 @@ cs_relation_cost_factors(Relation rel,
 						 bool *disk_cost_parallelizable,
 						 double *index_fetch_cost)
 {
+	CSMetaPageData meta;
+
 	/*
 	 * Columnar scans decompress and project columns, which is cheaper
 	 * per-tuple than heap's row-oriented processing when only a subset of
@@ -1832,7 +2909,45 @@ cs_relation_cost_factors(Relation rel,
 	*cpu_tuple_cost_factor = 0.5;
 	*disk_cost_parallelizable = false;
 	*index_fetch_cost = 0.0;
-	*rand_io_pages = 0;
+
+	/*
+	 * Below: rand_io_pages and index_fetch_cost are reported for a future
+	 * cost-modifier hook; cost_index() does not consume them today.
+	 */
+	if (RelationGetNumberOfBlocks(rel) > 0)
+	{
+		cs_read_metapage(rel, &meta);
+
+		/*
+		 * Each index probe into a columnstore row group needs to decompress
+		 * one chunk per projected column, not one heap-equivalent page per
+		 * tuple, so the random-I/O unit is the row group rather than the
+		 * page.
+		 */
+		*rand_io_pages = meta.cs_nrowgroups;
+
+		/*
+		 * Per-column per-tuple index fetch cost.
+		 *
+		 * Each index probe into a columnstore row group requires base-
+		 * decompressing the column chunk: reading avg_pages_per_chunk pages
+		 * from shared buffers and running LZ4/PGLZ decompression.  The
+		 * decompression CPU dominates -- empirically ~10x the cost of a
+		 * sequential page read per compressed page.
+		 */
+		if (meta.cs_nrowgroups > 0 && meta.cs_natts > 0 &&
+			meta.cs_data_pages > 0)
+		{
+			double		avg_pages_per_chunk;
+
+			avg_pages_per_chunk = (double) meta.cs_data_pages /
+				((double) meta.cs_nrowgroups * meta.cs_natts);
+
+			*index_fetch_cost = avg_pages_per_chunk * 10.0;
+		}
+	}
+	else
+		*rand_io_pages = 0;
 }
 
 int
@@ -1869,7 +2984,6 @@ cs_relation_estimate_size(Relation rel, int32 *attr_widths,
 {
 	BlockNumber nblocks;
 	CSMetaPageData meta;
-	BlockNumber delta_nblocks;
 
 	nblocks = RelationGetNumberOfBlocks(rel);
 
@@ -1889,17 +3003,18 @@ cs_relation_estimate_size(Relation rel, int32 *attr_widths,
 	 * count when cs_data_pages hasn't been set yet (pre-VACUUM).
 	 */
 	cs_read_metapage(rel, &meta);
-
-	delta_nblocks = meta.cs_delta_nblocks;
+	*tuples = (double) meta.cs_total_rows;
 	*pages = (meta.cs_data_pages > 0) ? meta.cs_data_pages : nblocks;
 
 	/*
-	 * Estimate tuples from delta-store pages only.  Columnar row group counts
-	 * arrive in a later step; for the delta-only AM, the planner sees only
-	 * what's in delta pages.
+	 * Report allvisfrac = 0.  An index-only scan needs the visibility map
+	 * fork to be set for the row's page in order to skip the heap fetch, and
+	 * this AM does not maintain a visibility map for the virtual TID range
+	 * that columnar rows live in.  Reporting a non-zero allvisfrac would let
+	 * the planner pick an IOS path whose execution still falls through to
+	 * cs_index_fetch_tuple for every row -- a plan-shape lie with no actual
+	 * heap-skip behind it.
 	 */
-	*tuples = (double) delta_nblocks * MaxHeapTuplesPerPage;
-
 	*allvisfrac = 0.0;
 }
 

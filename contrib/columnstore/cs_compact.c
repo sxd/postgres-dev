@@ -3195,28 +3195,43 @@ cs_rebuild_indexes(Relation rel)
 /*
  * Update an existing row group catalog entry in-place.
  *
- * Reads the catalog page, overwrites the entry with the new rg_desc,
- * and writes the page back via GenericXLog.
+ * Overwrites the entry with the new rg_desc and writes it back via
+ * GenericXLog.  A descriptor can exceed one page (roughly natts >= 68), in
+ * which case it was created spanning CS_PAGES_FOR_DATA(entry_size) consecutive
+ * blocks (see cs_write_rowgroup_catalog); mirror cs_read_rowgroup_catalog and
+ * rewrite every page rather than memcpy'ing the whole entry into the first
+ * page, which would overrun the buffer.  Each page is its own GenericXLog
+ * record (the entry may span more than the generic-xlog per-record page
+ * limit); for the common single-page case this is exactly the prior behavior.
  */
 static void
 cs_update_rowgroup_catalog(Relation rel, BlockNumber catalog_block,
 						   CSRowGroupDesc *rg_desc, int16 natts)
 {
-	Buffer		buf;
-	Page		page;
-	GenericXLogState *state;
 	Size		entry_size = CSRowGroupDescSize(natts);
+	Size		offset = 0;
+	BlockNumber blk = catalog_block;
 
-	buf = ReadBuffer(rel, catalog_block);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	while (offset < entry_size)
+	{
+		Buffer		buf;
+		Page		page;
+		GenericXLogState *state;
+		Size		chunk;
 
-	state = GenericXLogStart(rel);
-	page = GenericXLogRegisterBuffer(state, buf, 0);
+		buf = ReadBuffer(rel, blk++);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-	memcpy(PageGetContents(page), rg_desc, entry_size);
+		state = GenericXLogStart(rel);
+		page = GenericXLogRegisterBuffer(state, buf, 0);
 
-	GenericXLogFinish(state);
-	UnlockReleaseBuffer(buf);
+		chunk = Min(entry_size - offset, (Size) CS_COLDATA_PER_PAGE);
+		memcpy(PageGetContents(page), (const char *) rg_desc + offset, chunk);
+
+		GenericXLogFinish(state);
+		UnlockReleaseBuffer(buf);
+		offset += chunk;
+	}
 }
 
 
@@ -3272,6 +3287,21 @@ cs_classify_delta_tuple(HeapTupleHeader htup, TransactionId horizon)
 	if (TransactionIdIsValid(xmax) &&
 		!(htup->t_infomask & HEAP_XMAX_INVALID))
 	{
+		/*
+		 * A lock-only xmax (cs_tuple_lock) is not a delete.  While the locker
+		 * is live the row must stay at its TID -- moving it to columnar would
+		 * detach it from the lock -- so retain it; once the locker has ended
+		 * (committed or aborted), the lock is irrelevant and the row is
+		 * movable.
+		 */
+		if (htup->t_infomask & HEAP_XMAX_LOCK_ONLY)
+		{
+			if (TransactionIdIsCurrentTransactionId(xmax) ||
+				TransactionIdIsInProgress(xmax))
+				return CS_DELTA_TUPLE_RETAINED;
+			return CS_DELTA_TUPLE_MOVABLE;
+		}
+
 		if (TransactionIdIsCurrentTransactionId(xmax) ||
 			TransactionIdIsInProgress(xmax))
 			return CS_DELTA_TUPLE_RETAINED;
@@ -3552,6 +3582,24 @@ cs_materialize_tombstones(Relation rel, TransactionId horizon)
 				continue;
 
 			xmin = HeapTupleHeaderGetRawXmin(htup);
+
+			/*
+			 * A lock-only tombstone records a row lock, never a delete: it
+			 * must not reach the deletion bitmap.  Once its locking
+			 * transaction has ended (committed or aborted) it is spent; reap
+			 * it so it stops blocking page consumption.
+			 */
+			if (CS_TOMBSTONE_IS_LOCK_ONLY(htup))
+			{
+				if (TransactionIdIsValid(xmin) &&
+					!TransactionIdIsCurrentTransactionId(xmin) &&
+					!TransactionIdIsInProgress(xmin))
+				{
+					is_dead = true;
+					goto record_dead;
+				}
+				continue;
+			}
 
 			/* Skip in-progress tombstones from concurrent transactions */
 			if (TransactionIdIsValid(xmin) &&

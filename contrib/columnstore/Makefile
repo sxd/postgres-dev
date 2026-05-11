@@ -16,12 +16,22 @@ EXTENSION = columnstore
 DATA = columnstore--1.0.sql
 PGFILEDESC = "columnstore - columnar storage table access method"
 
-REGRESS = columnstore cs_compaction cs_delta_columnar cs_dictionary cs_encoding \
-	cs_index cs_misc cs_pushdown cs_scan_paths cs_zonemap
+REGRESS = columnstore cs_compaction cs_delete_update cs_delta_columnar \
+	cs_dictionary cs_encoding cs_index cs_misc cs_pushdown cs_scan_paths \
+	cs_zonemap
 
 ISOLATION = \
 	cs_vacuum_inflight \
-	cs_index_vacuum_window
+	cs_index_vacuum_window \
+	cs_delete_visibility \
+	cs_select_for_update \
+	cs_vacuum_concurrent \
+	cs_vacuum_snapshot \
+	cs_on_conflict_rr \
+	cs_index_visibility \
+	cs_unique_dirty \
+	cs_lock_for_update \
+	cs_fk_locking
 
 TAP_TESTS = 1
 

@@ -24,6 +24,26 @@ SELECT id, length(big_text) AS tlen, md5(big_text) AS thash, small_val
  20 | 3200 | e56e12605a3fe2aece8e27e95b77dd87 |       200
 (3 rows)
 
+-- Delete some and compact
+DELETE FROM cs_toast_stress WHERE id <= 15;
+SET columnstore.rowgroup_compaction_threshold = 0.5;
+VACUUM cs_toast_stress;
+RESET columnstore.rowgroup_compaction_threshold;
+-- Verify data survived compaction
+SELECT count(*) AS after_compact FROM cs_toast_stress;
+ after_compact 
+---------------
+             5
+(1 row)
+
+SELECT id, length(big_text) AS tlen, small_val
+    FROM cs_toast_stress WHERE id = 16;
+ id | tlen | small_val 
+----+------+-----------
+ 16 | 3200 |       160
+(1 row)
+
+DROP TABLE cs_toast_stress;
 -- ===================================================================
 -- Parallel scan correctness
 -- ===================================================================
@@ -195,6 +215,24 @@ SELECT sum(c1), sum(c100), sum(c200) FROM cs_wide_stress;
  20100 | 39900 | 59900
 (1 row)
 
+-- Delete and compact
+DELETE FROM cs_wide_stress WHERE c1 <= 150;
+SET columnstore.rowgroup_compaction_threshold = 0.5;
+VACUUM cs_wide_stress;
+RESET columnstore.rowgroup_compaction_threshold;
+SELECT count(*) AS after_compact FROM cs_wide_stress;
+ after_compact 
+---------------
+            50
+(1 row)
+
+SELECT c1, c100, c200 FROM cs_wide_stress WHERE c1 = 151;
+ c1  | c100 | c200 
+-----+------+------
+ 151 |  250 |  350
+(1 row)
+
+DROP TABLE cs_wide_stress;
 -- ===================================================================
 -- Numeric precision edge cases through full pipeline
 -- ===================================================================
@@ -395,7 +433,6 @@ SELECT id, length(payload) AS plen,
 -- stripe-side bytes and any external TOAST chunks are released
 -- after the metadata commit.
 DELETE FROM cs_big_datum WHERE id = 2;
-ERROR:  columnstore: columnar DELETE not yet supported
 SET columnstore.rowgroup_compaction_threshold = 0.5;
 VACUUM cs_big_datum;
 RESET columnstore.rowgroup_compaction_threshold;
@@ -406,9 +443,8 @@ SELECT id, length(payload) AS plen,
  id |  plen   |             head_md5             |             tail_md5             
 ----+---------+----------------------------------+----------------------------------
   1 | 4194310 | 39fe626613e443daf1138b995cc02847 | c1bb4f81d892b2d57947682aeb252456
-  2 | 4194310 | 34feca31454c1285bf56a7658d194e35 | c1bb4f81d892b2d57947682aeb252456
   3 | 4194310 | c092c185accd6b191c28467bcfbd3411 | c1bb4f81d892b2d57947682aeb252456
-(3 rows)
+(2 rows)
 
 DROP TABLE cs_big_datum;
 -- ===================================================================

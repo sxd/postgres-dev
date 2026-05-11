@@ -1,5 +1,5 @@
 --
--- Columnstore pushdown tests: scan key pushdown, bloom filter
+-- Columnstore pushdown tests: scan key pushdown, bloom filter, ON CONFLICT
 --
 
 -- ===================================================================
@@ -150,3 +150,47 @@ RESET enable_mergejoin;
 
 DROP TABLE cs_bloom_multi;
 DROP TABLE cs_bloom_multi_dim;
+
+-- ===================================================================
+-- ON CONFLICT (speculative insertion)
+-- ===================================================================
+CREATE TABLE cs_conflict (id int PRIMARY KEY, val text) USING columnstore;
+INSERT INTO cs_conflict VALUES (1, 'first'), (2, 'second');
+
+-- DO UPDATE: should update val for id=1
+INSERT INTO cs_conflict VALUES (1, 'conflict')
+    ON CONFLICT (id) DO UPDATE SET val = 'updated';
+SELECT * FROM cs_conflict WHERE id = 1;
+
+-- DO NOTHING: should silently skip
+INSERT INTO cs_conflict VALUES (2, 'ignored')
+    ON CONFLICT (id) DO NOTHING;
+SELECT * FROM cs_conflict WHERE id = 2;
+
+-- Non-conflicting insert should work normally
+INSERT INTO cs_conflict VALUES (3, 'third')
+    ON CONFLICT (id) DO NOTHING;
+SELECT * FROM cs_conflict WHERE id = 3;
+
+-- Batch ON CONFLICT
+INSERT INTO cs_conflict VALUES (1, 'batch1'), (2, 'batch2'), (4, 'new4')
+    ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+SELECT * FROM cs_conflict ORDER BY id;
+
+-- ON CONFLICT with columnar rows (freeze first, then conflict)
+VACUUM cs_conflict;
+INSERT INTO cs_conflict VALUES (1, 'post_freeze')
+    ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+SELECT * FROM cs_conflict WHERE id = 1;
+
+DROP TABLE cs_conflict;
+
+-- ON CONFLICT with expression index
+CREATE TABLE cs_conflict_expr (id int, val text, lowval text GENERATED ALWAYS AS (lower(val)) STORED) USING columnstore;
+CREATE UNIQUE INDEX ON cs_conflict_expr (lowval);
+INSERT INTO cs_conflict_expr (id, val) VALUES (1, 'Hello');
+INSERT INTO cs_conflict_expr (id, val) VALUES (2, 'HELLO')
+    ON CONFLICT (lowval) DO UPDATE SET val = EXCLUDED.val;
+SELECT id, val FROM cs_conflict_expr ORDER BY id;
+
+DROP TABLE cs_conflict_expr;

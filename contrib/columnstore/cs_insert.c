@@ -528,7 +528,8 @@ cs_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
  * committed tombstones into the deletion bitmap and removes them.
  */
 void
-cs_delta_insert_tombstone(Relation rel, ItemPointer target_tid)
+cs_delta_insert_tombstone(Relation rel, ItemPointer target_tid,
+						  uint16 extra_infomask)
 {
 	HeapTupleHeaderData hdr;
 	HeapTupleData tuple;
@@ -544,6 +545,7 @@ cs_delta_insert_tombstone(Relation rel, ItemPointer target_tid)
 	HeapTupleHeaderSetCmin(&hdr, GetCurrentCommandId(true));
 	HeapTupleHeaderSetXmax(&hdr, InvalidTransactionId);
 	hdr.t_infomask |= HEAP_XMAX_INVALID;
+	hdr.t_infomask |= extra_infomask;	/* lock-only tombstone bits, if any */
 	hdr.t_infomask2 = 0;		/* natts = 0 */
 	hdr.t_hoff = SizeofHeapTupleHeader;
 	hdr.t_ctid = *target_tid;
