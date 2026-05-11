@@ -96,13 +96,13 @@ SET min_parallel_table_scan_size = 0;
 SET max_parallel_workers_per_gather = 2;
 -- Verify parallel plan
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cs_parallel;
-                     QUERY PLAN                     
-----------------------------------------------------
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather
          Workers Planned: 2
          ->  Partial Aggregate
-               ->  Parallel Seq Scan on cs_parallel
+               ->  Parallel Custom Scan (ColumnstoreScan) on cs_parallel
 (5 rows)
 
 -- Compare results
@@ -568,13 +568,13 @@ SET min_parallel_table_scan_size = 0;
 SET max_parallel_workers_per_gather = 2;
 -- parallel aggregate pushdown must count the delta rows
 EXPLAIN (COSTS OFF) SELECT count(*) FROM cs_par_snap;
-                     QUERY PLAN                     
-----------------------------------------------------
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather
          Workers Planned: 2
          ->  Partial Aggregate
-               ->  Parallel Seq Scan on cs_par_snap
+               ->  Parallel Custom Scan (ColumnstoreScan) on cs_par_snap
 (5 rows)
 
 SELECT count(*) FROM cs_par_snap;

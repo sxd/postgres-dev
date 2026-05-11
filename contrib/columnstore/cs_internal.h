@@ -656,6 +656,10 @@ typedef struct CScanDescData
 	bool	  **bf_dk_match;	/* [nfilters][dict_code] bloom match? */
 	uint32	   *bf_dk_match_rg; /* [nfilters] row group for which dk_match is
 								 * valid */
+	FmgrInfo   *bf_hashfn;		/* [nfilters] hash fn used to key the filter */
+	Oid		   *bf_hashcoll;	/* [nfilters] collation for the hash fn */
+	bool		bf_disabled;	/* probing turned off (ineffective filter) */
+	uint64		bf_rows_examined;	/* rows that reached the bloom probe */
 
 	/* bitmap scan state */
 	bool		bm_started;		/* has TBM iteration begun? */
@@ -695,6 +699,12 @@ typedef struct CScanDescData
 	uint64		instr_rg_examined;	/* row groups whose catalog was read */
 	uint64		instr_rg_zonemap_skipped;	/* skipped by
 											 * cs_zonemap_skip_rowgroup */
+	uint64		instr_bloom_rg_probed;	/* row groups a pushed bloom filter
+										 * probed */
+	uint64		instr_bloom_rg_skipped; /* row groups bloom eliminated
+										 * entirely */
+	uint64		instr_bloom_rows_removed;	/* rows a pushed bloom filter
+											 * removed */
 
 	CSColumnCache colcache;
 } CScanDescData;
@@ -732,6 +742,18 @@ typedef struct CSParallelScanDescData
 	uint32		pcs_rgdir_npages;
 
 	pg_atomic_uint64 pcs_nallocated;	/* next work unit to hand out */
+
+	/*
+	 * EXPLAIN ANALYZE instrumentation, summed across all participants.  Each
+	 * participant folds its private scan counters in here from
+	 * cs_shutdown_custom_scan.  As a child of Gather that callback runs while
+	 * this descriptor is still mapped, and a worker's runs before it signals
+	 * EOF, so by the time the leader's runs (after Gather has consumed every
+	 * worker's output) the workers' contributions are all present; the leader
+	 * then folds the shared totals into its own scan for the EXPLAIN output.
+	 */
+	pg_atomic_uint64 pcs_instr_rg_examined;
+	pg_atomic_uint64 pcs_instr_rg_zonemap_skipped;
 } CSParallelScanDescData;
 
 typedef CSParallelScanDescData *CSParallelScanDesc;
@@ -886,7 +908,8 @@ extern void cs_scan_set_projection(TableScanDesc scan,
 extern void cs_scan_set_qual_keys(TableScanDesc scan, int nkeys,
 								  ScanKeyData *keys);
 extern void cs_scan_set_bloom_filter(TableScanDesc scan, AttrNumber attno,
-									 struct bloom_filter *filter);
+									 struct bloom_filter *filter,
+									 Oid hashfn, Oid hashcoll);
 extern bool cs_scan_column_encoding(TableScanDesc scan, AttrNumber attno,
 									Oid *phys_type, int32 *dscale);
 extern bool cs_scan_get_raw_attr(TableScanDesc scan, TupleTableSlot *slot,
@@ -928,6 +951,9 @@ extern void cs_relation_cost_factors(Relation rel,
 									 double *index_fetch_cost);
 extern int	cs_compute_parallel_workers(Relation rel);
 extern const char *cs_get_sort_key(Relation rel);
+
+/* cs_customscan.c */
+extern void cs_register_custom_scan_methods(void);
 
 /* cs_compact.c */
 extern void cs_compact_delta(Relation rel);

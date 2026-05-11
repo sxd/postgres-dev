@@ -215,3 +215,120 @@ SELECT count(*) FROM cs_scan_allnull WHERE v IS NOT NULL;
 (1 row)
 
 DROP TABLE cs_scan_allnull;
+-- ===================================================================
+-- Partitions get ColumnstoreScan paths and safe SCROLL cursors
+--
+-- Partition children are RELOPT_OTHER_MEMBER_REL; skipping them left
+-- partitions on stock SeqScan paths, which lose the pushdowns and --
+-- because ExecSupportsBackwardScan(SeqScan) is true -- let a SCROLL
+-- cursor scan backward over an executor that cannot, returning wrong
+-- rows.  With ColumnstoreScan the planner materializes for SCROLL.
+-- ===================================================================
+CREATE TABLE cs_part (a int, b text) PARTITION BY RANGE (a);
+CREATE TABLE cs_part_1 PARTITION OF cs_part FOR VALUES FROM (1) TO (100)
+    USING columnstore;
+CREATE TABLE cs_part_2 PARTITION OF cs_part FOR VALUES FROM (100) TO (200)
+    USING columnstore;
+INSERT INTO cs_part SELECT i, 'p_' || i FROM generate_series(1, 199) i;
+VACUUM cs_part_1;
+VACUUM cs_part_2;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cs_part WHERE a < 150;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Custom Scan (ColumnstoreScan) on cs_part_1
+               Filter: (a < 150)
+               Columnstore Projected Columns: a
+         ->  Custom Scan (ColumnstoreScan) on cs_part_2
+               Filter: (a < 150)
+               Columnstore Projected Columns: a
+(8 rows)
+
+SELECT count(*) FROM cs_part WHERE a < 150;
+ count 
+-------
+   149
+(1 row)
+
+BEGIN;
+DECLARE cs_scroll SCROLL CURSOR FOR SELECT a FROM cs_part ORDER BY a;
+FETCH 5 FROM cs_scroll;
+ a 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)
+
+FETCH BACKWARD 3 FROM cs_scroll;
+ a 
+---
+ 4
+ 3
+ 2
+(3 rows)
+
+FETCH 4 FROM cs_scroll;
+ a 
+---
+ 3
+ 4
+ 5
+ 6
+(4 rows)
+
+CLOSE cs_scroll;
+COMMIT;
+DROP TABLE cs_part;
+-- ===================================================================
+-- Rescans: TABLESAMPLE and parameterized bitmap inners under nestloop
+--
+-- Sample-scan and bitmap-scan per-page state must reset on rescan;
+-- stale state once returned zero rows from the second TABLESAMPLE
+-- execution and leftover offsets from the previous bitmap.
+-- ===================================================================
+CREATE TABLE cs_resc_outer (k int);
+INSERT INTO cs_resc_outer VALUES (1), (2), (3);
+CREATE TABLE cs_resc_inner (k int, v int) USING columnstore;
+INSERT INTO cs_resc_inner SELECT i % 3 + 1, i FROM generate_series(1, 600) i;
+VACUUM cs_resc_inner;
+CREATE INDEX cs_resc_inner_v ON cs_resc_inner (v);
+ANALYZE cs_resc_outer;
+ANALYZE cs_resc_inner;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_memoize = off;
+-- repeatable TABLESAMPLE rescanned once per outer row: identical
+-- sample every time, so 3x the single-scan count
+SELECT count(*) FROM cs_resc_outer o,
+  LATERAL (SELECT v FROM cs_resc_inner TABLESAMPLE BERNOULLI (100) REPEATABLE (42)) s;
+ count 
+-------
+  1800
+(1 row)
+
+-- parameterized bitmap inner: each outer row sees its own matches
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = on;
+SELECT o.k, (SELECT count(*) FROM cs_resc_inner i
+             WHERE i.v BETWEEN o.k * 100 AND o.k * 100 + 50) AS hits
+    FROM cs_resc_outer o ORDER BY o.k;
+ k | hits 
+---+------
+ 1 |   51
+ 2 |   51
+ 3 |   51
+(3 rows)
+
+RESET enable_seqscan;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_memoize;
+DROP TABLE cs_resc_outer;
+DROP TABLE cs_resc_inner;

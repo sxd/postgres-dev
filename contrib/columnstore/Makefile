@@ -5,6 +5,7 @@ OBJS = \
 	$(WIN32RES) \
 	columnstore.o \
 	cs_compact.o \
+	cs_customscan.o \
 	cs_insert.o \
 	cs_reloptions.o \
 	cs_scan.o \
@@ -16,9 +17,19 @@ EXTENSION = columnstore
 DATA = columnstore--1.0.sql
 PGFILEDESC = "columnstore - columnar storage table access method"
 
-REGRESS = columnstore cs_compaction cs_delete_update cs_delta_columnar \
-	cs_dictionary cs_encoding cs_index cs_misc cs_pushdown cs_scan_paths \
-	cs_zonemap
+REGRESS = columnstore \
+	cs_encoding \
+	cs_dictionary \
+	cs_zonemap \
+	cs_delta_columnar \
+	cs_delete_update \
+	cs_scan_paths \
+	cs_compaction \
+	cs_pushdown \
+	cs_index \
+	cs_misc \
+	cs_sort_key \
+	cs_planner
 
 ISOLATION = \
 	cs_vacuum_inflight \

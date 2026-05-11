@@ -320,19 +320,21 @@ INSERT INTO cs_totalrows SELECT i FROM generate_series(1, 500) i;
 VACUUM cs_totalrows;
 -- Planner estimate should be close to 500 after VACUUM
 EXPLAIN (FORMAT TEXT) SELECT * FROM cs_totalrows;
-                          QUERY PLAN                          
---------------------------------------------------------------
- Seq Scan on cs_totalrows  (cost=0.00..6.00 rows=500 width=4)
-(1 row)
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Custom Scan (ColumnstoreScan) on cs_totalrows  (cost=0.00..3.00 rows=500 width=4)
+   Columnstore Projected Columns: id
+(2 rows)
 
 -- Delete half the rows (creates tombstones, no cs_total_rows change)
 DELETE FROM cs_totalrows WHERE id <= 250;
 -- Before VACUUM, estimate is still ~500 (tombstones don't inflate it)
 EXPLAIN (FORMAT TEXT) SELECT * FROM cs_totalrows;
-                          QUERY PLAN                          
---------------------------------------------------------------
- Seq Scan on cs_totalrows  (cost=0.00..6.00 rows=500 width=4)
-(1 row)
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Custom Scan (ColumnstoreScan) on cs_totalrows  (cost=0.00..3.00 rows=500 width=4)
+   Columnstore Projected Columns: id
+(2 rows)
 
 -- VACUUM corrects cs_total_rows to the live count
 SET columnstore.rowgroup_compaction_threshold = 0.5;
@@ -340,10 +342,11 @@ VACUUM cs_totalrows;
 RESET columnstore.rowgroup_compaction_threshold;
 -- Estimate should now be ~250
 EXPLAIN (FORMAT TEXT) SELECT * FROM cs_totalrows;
-                          QUERY PLAN                          
---------------------------------------------------------------
- Seq Scan on cs_totalrows  (cost=0.00..3.50 rows=250 width=4)
-(1 row)
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Custom Scan (ColumnstoreScan) on cs_totalrows  (cost=0.00..1.75 rows=250 width=4)
+   Columnstore Projected Columns: id
+(2 rows)
 
 DROP TABLE cs_totalrows;
 -- ===================================================================
@@ -801,3 +804,39 @@ SELECT * FROM cs_alldel;
 (1 row)
 
 DROP TABLE cs_alldel;
+-- Wide table: the row group descriptor (per-column chunk descriptors + zone
+-- maps) exceeds one catalog page beyond ~68 columns, so it is stored spanning
+-- several consecutive pages.  DELETE + VACUUM materializes the tombstones into
+-- the deletion bitmap and rewrites that multi-page descriptor; the rewrite must
+-- update every page, not just the first.  Read columns from across the entry
+-- (first, middle, last) after the rewrite to confirm it stayed intact.
+SELECT format('CREATE TABLE cs_wide (%s) USING columnstore',
+              string_agg(format('c%s int', g), ', '))
+  FROM generate_series(1, 100) g \gexec
+CREATE TABLE cs_wide (c1 int, c2 int, c3 int, c4 int, c5 int, c6 int, c7 int, c8 int, c9 int, c10 int, c11 int, c12 int, c13 int, c14 int, c15 int, c16 int, c17 int, c18 int, c19 int, c20 int, c21 int, c22 int, c23 int, c24 int, c25 int, c26 int, c27 int, c28 int, c29 int, c30 int, c31 int, c32 int, c33 int, c34 int, c35 int, c36 int, c37 int, c38 int, c39 int, c40 int, c41 int, c42 int, c43 int, c44 int, c45 int, c46 int, c47 int, c48 int, c49 int, c50 int, c51 int, c52 int, c53 int, c54 int, c55 int, c56 int, c57 int, c58 int, c59 int, c60 int, c61 int, c62 int, c63 int, c64 int, c65 int, c66 int, c67 int, c68 int, c69 int, c70 int, c71 int, c72 int, c73 int, c74 int, c75 int, c76 int, c77 int, c78 int, c79 int, c80 int, c81 int, c82 int, c83 int, c84 int, c85 int, c86 int, c87 int, c88 int, c89 int, c90 int, c91 int, c92 int, c93 int, c94 int, c95 int, c96 int, c97 int, c98 int, c99 int, c100 int) USING columnstore
+SELECT format('INSERT INTO cs_wide SELECT %s FROM generate_series(1, 2000) g',
+              string_agg('g', ', '))
+  FROM generate_series(1, 100) g \gexec
+INSERT INTO cs_wide SELECT g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g, g FROM generate_series(1, 2000) g
+VACUUM cs_wide;
+SELECT count(*), sum(c1), sum(c50), sum(c100) FROM cs_wide;
+ count |   sum   |   sum   |   sum   
+-------+---------+---------+---------
+  2000 | 2001000 | 2001000 | 2001000
+(1 row)
+
+DELETE FROM cs_wide WHERE c1 % 7 = 0;
+VACUUM cs_wide;
+SELECT count(*), sum(c1), sum(c50), sum(c100) FROM cs_wide;
+ count |   sum   |   sum   |   sum   
+-------+---------+---------+---------
+  1715 | 1715715 | 1715715 | 1715715
+(1 row)
+
+SELECT c1, c50, c100 FROM cs_wide WHERE c1 = 100;
+ c1  | c50 | c100 
+-----+-----+------
+ 100 | 100 |  100
+(1 row)
+
+DROP TABLE cs_wide;

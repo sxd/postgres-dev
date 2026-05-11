@@ -2434,9 +2434,9 @@ cs_write_one_rowgroup(Relation rel, TupleDesc tupdesc, int natts,
 				}
 				else
 				{
-					store_att_byval(values_start + row * attr->attlen,
-									col_values[col][row],
-									attr->attlen);
+					cs_store_att_byval(values_start + row * attr->attlen,
+									   col_values[col][row],
+									   attr->attlen);
 				}
 			}
 		}

@@ -276,6 +276,7 @@ static void cs_preload_qual_columns(CScanDesc scan, CSColumnCache *cache,
 									Relation rel);
 static void cs_build_selection_bitmap(CScanDesc scan, CSColumnCache *cache,
 									  Relation rel);
+static uint32 cs_sel_count(const char *sel_bitmap, uint32 nrows);
 static bool cs_load_rowgroup_countonly(CScanDesc scan, Relation rel,
 									   uint32 rg_id);
 static bool cs_columnar_getnext_countonly(CScanDesc scan,
@@ -671,7 +672,8 @@ cs_scan_end(TableScanDesc sscan)
 	}
 
 	/* Clean up bloom filter state */
-	cs_scan_set_bloom_filter((TableScanDesc) scan, 0, NULL);
+	cs_scan_set_bloom_filter((TableScanDesc) scan, 0, NULL,
+							 InvalidOid, InvalidOid);
 
 	/*
 	 * All cache-lifetime scan state (column data, bitmaps, tombstones) lives
@@ -760,6 +762,10 @@ cs_scan_rescan(TableScanDesc sscan, ScanKeyData *key,
 	 */
 	scan->instr_rg_examined = 0;
 	scan->instr_rg_zonemap_skipped = 0;
+	scan->instr_bloom_rg_probed = 0;
+	scan->instr_bloom_rg_skipped = 0;
+	scan->instr_bloom_rows_removed = 0;
+	scan->bf_rows_examined = 0;
 
 	if (key)
 		sscan->rs_key = key;
@@ -1011,13 +1017,6 @@ cs_scan_set_qual_keys(TableScanDesc sscan, int nkeys, ScanKeyData *keys)
 static void
 cs_zonemap_init_cmp_cache(CScanDesc scan)
 {
-	/*
-	 * Index builds must index rows with pending or committed deletes too:
-	 * older snapshots may still see them, and the fetch path hides what a
-	 * given snapshot must not.  Applying tombstones here -- worse, under
-	 * SnapshotAny, where even an aborted delete reads as one -- would leave
-	 * those rows out of the index for good.
-	 */
 	Relation	rel = scan->rs_base.rs_rd;
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	int			nkeys = scan->cs_nkeys;
@@ -1304,28 +1303,25 @@ set_match:
 }
 
 /*
- * Test whether a datum value is absent from a bloom filter, hashing the
- * actual data bytes appropriate to the type (by-value, varlena, or
- * fixed-length by-reference).
+ * Test whether a datum value is absent from a bloom filter.
+ *
+ * The filter is keyed on the 32-bit join hash value (the hashjoin builds it
+ * that way via ExecBuildHash32Expr), so we hash the value with the join key's
+ * hash function rather than the raw bytes.  For a single-key join this matches
+ * the combined filter exactly; for a multi-key join it matches the
+ * corresponding per-key filter.  'hashfn'/'coll' come from the join operator's
+ * outer hash function (see cs_apply_pushed_bloom_filters); the Hash node
+ * built the filter with the operator's *inner* hash function, which is safe
+ * because the hash-join opfamily contract requires both sides to hash equal
+ * values identically.
  */
 static inline bool
-bloom_lacks_datum(bloom_filter *filter, Datum val, Form_pg_attribute attr)
+bloom_lacks_value(bloom_filter *filter, FmgrInfo *hashfn, Oid coll, Datum val)
 {
-	if (attr->attbyval)
-		return bloom_lacks_element(filter,
-								   (unsigned char *) &val, sizeof(Datum));
-	else if (attr->attlen == -1)
-	{
-		void	   *ptr = DatumGetPointer(val);
+	uint32		hash = DatumGetUInt32(FunctionCall1Coll(hashfn, coll, val));
 
-		return bloom_lacks_element(filter,
-								   (unsigned char *) VARDATA_ANY(ptr),
-								   VARSIZE_ANY_EXHDR(ptr));
-	}
-	else
-		return bloom_lacks_element(filter,
-								   (unsigned char *) DatumGetPointer(val),
-								   attr->attlen);
+	return bloom_lacks_element(filter,
+							   (unsigned char *) &hash, sizeof(hash));
 }
 
 /*
@@ -1522,11 +1518,10 @@ cs_row_passes_scan_keys(CScanDesc scan, CSColumnCache *cache, uint32 row)
 		}
 	}
 
-	/* Bloom filter check */
-	for (int f = 0; f < scan->bf_nfilters; f++)
+	/* Bloom filter check (skipped once adaptively disabled) */
+	for (int f = 0; !scan->bf_disabled && f < scan->bf_nfilters; f++)
 	{
 		int			bf_col = scan->bf_attnos[f] - 1;
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, bf_col);
 		Datum		val;
 		bool		isnull;
 
@@ -1548,8 +1543,10 @@ cs_row_passes_scan_keys(CScanDesc scan, CSColumnCache *cache, uint32 row)
 
 				for (int d = 0; d < dict->dict_count; d++)
 				{
-					if (!bloom_lacks_datum(scan->bf_filters[f],
-										   dict->dict_values[d], attr))
+					if (!bloom_lacks_value(scan->bf_filters[f],
+										   &scan->bf_hashfn[f],
+										   scan->bf_hashcoll[f],
+										   dict->dict_values[d]))
 						scan->bf_dk_match[f][d] = true;
 				}
 
@@ -1580,7 +1577,8 @@ cs_row_passes_scan_keys(CScanDesc scan, CSColumnCache *cache, uint32 row)
 			if (isnull)
 				return false;
 
-			if (bloom_lacks_datum(scan->bf_filters[f], val, attr))
+			if (bloom_lacks_value(scan->bf_filters[f], &scan->bf_hashfn[f],
+								  scan->bf_hashcoll[f], val))
 				return false;
 		}
 	}
@@ -1634,6 +1632,24 @@ cs_preload_qual_columns(CScanDesc scan, CSColumnCache *cache, Relation rel)
  * Must be called after cs_preload_qual_columns() has decompressed all
  * qual columns for the current row group.
  */
+/*
+ * Count the rows still selected in a selection bitmap.  Used to measure how
+ * many rows a pushed-down bloom filter removed, both for EXPLAIN ANALYZE
+ * instrumentation and for the adaptive disable decision.
+ */
+static uint32
+cs_sel_count(const char *sel_bitmap, uint32 nrows)
+{
+	uint32		count = 0;
+
+	for (uint32 i = 0; i < nrows; i++)
+	{
+		if (CS_ISSELECTED(sel_bitmap, i))
+			count++;
+	}
+	return count;
+}
+
 /*
  * Apply a dictionary match array to the selection bitmap.
  * Deselects rows whose dictionary code does not appear in the match table.
@@ -2097,54 +2113,113 @@ cs_build_selection_bitmap(CScanDesc scan, CSColumnCache *cache, Relation rel)
 		}
 	}
 
-	/* Apply bloom filter predicates */
-	for (int f = 0; f < scan->bf_nfilters; f++)
+	/*
+	 * Apply bloom filter predicates pushed down from a hash join.
+	 *
+	 * Unlike the scan keys above, a bloom filter is a pure optimization: the
+	 * producing hash join still rejects any non-matching outer tuple, so we
+	 * are free to skip probing whenever it is not paying off.  Because we
+	 * build the filter eagerly (HashJoin.bloom_eager), we cannot use the core
+	 * executor's "wait 1000 lookups then decide" heuristic -- by the time we
+	 * have probed that many rows we have already decompressed the row groups
+	 * we hoped to skip.  Instead we measure the prune rate at row-group
+	 * granularity and disable probing once it is clearly ineffective (e.g. a
+	 * foreign-key join where every outer row matches), mirroring the core
+	 * adaptive-disable idea without its per-tuple state.
+	 *
+	 * The disable is one-way (we do not re-enable and re-sample as the core
+	 * heuristic does), so a filter that only becomes selective on later row
+	 * groups -- matches clustered into the first few groups -- can be turned
+	 * off prematurely.  Acceptable as a first cut; a rolling re-enable would
+	 * refine it.
+	 */
+#define CS_BLOOM_MIN_RGS_BEFORE_DISABLE 4
+#define CS_BLOOM_DISABLE_PRUNE_NUM 1	/* disable below 1/20 == 5% removed */
+#define CS_BLOOM_DISABLE_PRUNE_DEN 20
+	if (scan->bf_nfilters > 0 && !scan->bf_disabled)
 	{
-		int			bf_col = scan->bf_attnos[f] - 1;
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, bf_col);
+		uint32		sel_before = cs_sel_count(scan->sel_bitmap, nrows);
+		uint32		sel_after;
 
-		cs_ensure_column_loaded(cache, rel, bf_col);
-
-		if (cache->col_dict && cache->col_dict[bf_col] != NULL)
+		/* Apply bloom filter predicates */
+		for (int f = 0; f < scan->bf_nfilters; f++)
 		{
-			CSDictColumn *dict = cache->col_dict[bf_col];
+			int			bf_col = scan->bf_attnos[f] - 1;
 
-			/* Build bloom dict match array once per row group */
-			if (scan->bf_dk_match_rg[f] != scan->cur_rowgroup)
+			cs_ensure_column_loaded(cache, rel, bf_col);
+
+			if (cache->col_dict && cache->col_dict[bf_col] != NULL)
 			{
-				if (scan->bf_dk_match[f])
-					pfree(scan->bf_dk_match[f]);
+				CSDictColumn *dict = cache->col_dict[bf_col];
 
-				scan->bf_dk_match[f] = palloc0(sizeof(bool) * (dict->dict_count + 1));
-				for (int d = 0; d < dict->dict_count; d++)
+				/* Build bloom dict match array once per row group */
+				if (scan->bf_dk_match_rg[f] != scan->cur_rowgroup)
 				{
-					if (!bloom_lacks_datum(scan->bf_filters[f],
-										   dict->dict_values[d], attr))
-						scan->bf_dk_match[f][d] = true;
+					if (scan->bf_dk_match[f])
+						pfree(scan->bf_dk_match[f]);
+
+					/* Rowgroup-lifetime: cache context, not a per-row one. */
+					scan->bf_dk_match[f] =
+						MemoryContextAllocZero(cache->cc_cxt ? cache->cc_cxt
+											   : CurrentMemoryContext,
+											   sizeof(bool) * (dict->dict_count + 1));
+					for (int d = 0; d < dict->dict_count; d++)
+					{
+						if (!bloom_lacks_value(scan->bf_filters[f],
+											   &scan->bf_hashfn[f],
+											   scan->bf_hashcoll[f],
+											   dict->dict_values[d]))
+							scan->bf_dk_match[f][d] = true;
+					}
+					scan->bf_dk_match_rg[f] = scan->cur_rowgroup;
 				}
-				scan->bf_dk_match_rg[f] = scan->cur_rowgroup;
-			}
 
-			cs_sel_bitmap_apply_dict(scan->sel_bitmap, dict,
-									 scan->bf_dk_match[f], nrows);
-		}
-		else
-		{
-			/* Non-dict column: per-row bloom filter check */
-			for (uint32 row = 0; row < nrows; row++)
+				cs_sel_bitmap_apply_dict(scan->sel_bitmap, dict,
+										 scan->bf_dk_match[f], nrows);
+			}
+			else
 			{
-				Datum		val;
-				bool		isnull;
+				/* Non-dict column: per-row bloom filter check */
+				for (uint32 row = 0; row < nrows; row++)
+				{
+					Datum		val;
+					bool		isnull;
 
-				if (!CS_ISSELECTED(scan->sel_bitmap, row))
-					continue;
+					if (!CS_ISSELECTED(scan->sel_bitmap, row))
+						continue;
 
-				val = cs_cache_get_value(cache, tupdesc, bf_col, row, &isnull);
-				if (isnull || bloom_lacks_datum(scan->bf_filters[f], val, attr))
-					CS_DESELECT_ROW(scan->sel_bitmap, row);
+					val = cs_cache_get_value(cache, tupdesc, bf_col, row, &isnull);
+					if (isnull ||
+						bloom_lacks_value(scan->bf_filters[f], &scan->bf_hashfn[f],
+										  scan->bf_hashcoll[f], val))
+						CS_DESELECT_ROW(scan->sel_bitmap, row);
+				}
 			}
 		}
+
+		/* Account for what the bloom filters removed in this row group. */
+		sel_after = cs_sel_count(scan->sel_bitmap, nrows);
+		scan->instr_bloom_rg_probed++;
+		scan->bf_rows_examined += sel_before;
+		scan->instr_bloom_rows_removed += (sel_before - sel_after);
+		if (sel_before > 0 && sel_after == 0)
+			scan->instr_bloom_rg_skipped++;
+
+		/*
+		 * Adaptive disable: once we have probed a few row groups, give up on
+		 * the filter if it is removing too few rows to be worth the probe and
+		 * the extra payload columns it forces us to decompress.  This is
+		 * always correct -- the hash join above still does the real matching.
+		 */
+		if (scan->instr_bloom_rg_probed >= CS_BLOOM_MIN_RGS_BEFORE_DISABLE &&
+			scan->instr_bloom_rows_removed <
+			scan->bf_rows_examined * CS_BLOOM_DISABLE_PRUNE_NUM /
+			CS_BLOOM_DISABLE_PRUNE_DEN)
+			scan->bf_disabled = true;
 	}
+#undef CS_BLOOM_MIN_RGS_BEFORE_DISABLE
+#undef CS_BLOOM_DISABLE_PRUNE_NUM
+#undef CS_BLOOM_DISABLE_PRUNE_DEN
 
 	scan->sel_bitmap_valid = true;
 }
@@ -4784,14 +4859,22 @@ cs_scan_get_raw_attr(TableScanDesc sscan, TupleTableSlot *slot,
 }
 
 /*
- * Push a bloom filter down to the scan for hash join probe filtering.
+ * Register a bloom filter pushed down to the scan for hash join probe
+ * filtering, or clear all filters.
  *
- * Each call pushes one filter for one column.  Up to 8 filters can be
- * active simultaneously.  Passing filter=NULL clears all filters.
+ * Each call registers one filter for one column, together with the hash
+ * function (and collation) used to key it -- the hashjoin builds the filter on
+ * the 32-bit join hash value, so the scan must probe it the same way (see
+ * bloom_lacks_value).  Up to 8 filters can be active simultaneously.  Passing
+ * filter == NULL clears all filters.
+ *
+ * This is no longer a table-AM callback: it is driven by
+ * cs_apply_pushed_bloom_filters(), which translates the filters the planner
+ * pushed onto the CustomScan into per-column entries here.
  */
 void
 cs_scan_set_bloom_filter(TableScanDesc sscan, AttrNumber attno,
-						 bloom_filter *filter)
+						 bloom_filter *filter, Oid hashfn, Oid hashcoll)
 {
 	CScanDesc	scan = (CScanDesc) sscan;
 
@@ -4814,11 +4897,20 @@ cs_scan_set_bloom_filter(TableScanDesc sscan, AttrNumber attno,
 			pfree(scan->bf_dk_match);
 		if (scan->bf_dk_match_rg)
 			pfree(scan->bf_dk_match_rg);
+		if (scan->bf_hashfn)
+			pfree(scan->bf_hashfn);
+		if (scan->bf_hashcoll)
+			pfree(scan->bf_hashcoll);
 		scan->bf_filters = NULL;
 		scan->bf_attnos = NULL;
 		scan->bf_dk_match = NULL;
 		scan->bf_dk_match_rg = NULL;
+		scan->bf_hashfn = NULL;
+		scan->bf_hashcoll = NULL;
 		scan->bf_nfilters = 0;
+		/* Restart the adaptive-disable decision for any re-pushed filters. */
+		scan->bf_disabled = false;
+		scan->bf_rows_examined = 0;
 		return;
 	}
 
@@ -4829,6 +4921,8 @@ cs_scan_set_bloom_filter(TableScanDesc sscan, AttrNumber attno,
 		scan->bf_attnos = palloc(sizeof(AttrNumber) * 8);
 		scan->bf_dk_match = palloc0(sizeof(bool *) * 8);
 		scan->bf_dk_match_rg = palloc(sizeof(uint32) * 8);
+		scan->bf_hashfn = palloc0(sizeof(FmgrInfo) * 8);
+		scan->bf_hashcoll = palloc(sizeof(Oid) * 8);
 		for (int i = 0; i < 8; i++)
 			scan->bf_dk_match_rg[i] = UINT32_MAX;
 	}
@@ -4840,6 +4934,8 @@ cs_scan_set_bloom_filter(TableScanDesc sscan, AttrNumber attno,
 
 		scan->bf_filters[idx] = filter;
 		scan->bf_attnos[idx] = attno;
+		fmgr_info(hashfn, &scan->bf_hashfn[idx]);
+		scan->bf_hashcoll[idx] = hashcoll;
 		scan->bf_nfilters++;
 	}
 }

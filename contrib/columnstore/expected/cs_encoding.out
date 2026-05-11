@@ -655,3 +655,28 @@ SELECT count(*) FILTER (WHERE c = 'green') AS greens,
 DROP TABLE cs_enc_exotic;
 DROP TYPE cs_enc_color, cs_enc_pair;
 DROP DOMAIN cs_enc_posint;
+-- Gorilla float encoding: high-entropy float8 values exercise the XOR
+-- "new window" path (the widest per-value output).  The encoder must size its
+-- output buffer for that worst case (and bail to uncompressed rather than
+-- overrun).  hashint4 gives deterministic pseudo-random values; verify they
+-- round-trip through VACUUM compaction and that scanned aggregates agree.
+CREATE TABLE cs_gorilla_float (id int, v float8) USING columnstore;
+INSERT INTO cs_gorilla_float
+    SELECT i, hashint4(i)::float8 / 7.0 FROM generate_series(1, 5000) i;
+VACUUM cs_gorilla_float;
+SELECT count(*) = 5000 AS n_ok, count(DISTINCT v) = 5000 AS all_distinct
+    FROM cs_gorilla_float;
+ n_ok | all_distinct 
+------+--------------
+ t    | t
+(1 row)
+
+SELECT id, v FROM cs_gorilla_float WHERE id IN (1, 2500, 5000) ORDER BY id;
+  id  |          v          
+------+---------------------
+    1 | -272151432.28571427
+ 2500 |  41036814.571428575
+ 5000 | -235360313.14285713
+(3 rows)
+
+DROP TABLE cs_gorilla_float;

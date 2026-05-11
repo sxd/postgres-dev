@@ -3,6 +3,7 @@
 columnstore_sources = files(
   'columnstore.c',
   'cs_compact.c',
+  'cs_customscan.c',
   'cs_insert.c',
   'cs_reloptions.c',
   'cs_scan.c',
@@ -37,16 +38,18 @@ tests += {
   'regress': {
     'sql': [
       'columnstore',
-      'cs_compaction',
-      'cs_delete_update',
-      'cs_delta_columnar',
-      'cs_dictionary',
       'cs_encoding',
+      'cs_dictionary',
+      'cs_zonemap',
+      'cs_delta_columnar',
+      'cs_delete_update',
+      'cs_scan_paths',
+      'cs_compaction',
+      'cs_pushdown',
       'cs_index',
       'cs_misc',
-      'cs_pushdown',
-      'cs_scan_paths',
-      'cs_zonemap',
+      'cs_sort_key',
+      'cs_planner',
     ],
   },
   'isolation': {

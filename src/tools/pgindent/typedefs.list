@@ -395,6 +395,7 @@ CRITICAL_SECTION
 CRSSnapshotAction
 CSColumnCache
 CSColumnChunkDesc
+CSCustomScanState
 CSDeltaPageOpaque
 CSDeltaTupleClass
 CSDictColumn

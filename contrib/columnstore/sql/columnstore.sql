@@ -324,6 +324,81 @@ SELECT count(*) AS zm_neg_eq_pushdown FROM cs_wide_zm WHERE h = -751282342672794
 SELECT count(*) AS zm_neg_eq_nopd     FROM cs_wide_zm WHERE h + 0 = -7512823426727949328;
 DROP TABLE cs_wide_zm;
 
+-- Parallel worker limiting: few row groups should suppress parallel scan
+DROP TABLE cs_basic;
+CREATE TABLE cs_basic (a int, b text) USING columnstore;
+-- 1 row group only → 1 work unit < 2, no parallel
+INSERT INTO cs_basic SELECT i, 'rg1-' || i FROM generate_series(1, 100) i;
+VACUUM cs_basic;
+
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+
+-- A bare count(*) is pushed down to a serial ColumnstoreAggregate, which
+-- masks the scan's parallelism; fence a row-returning subquery with
+-- OFFSET 0 so the plan exposes the ColumnstoreScan itself.
+-- Should NOT show Gather node (only 1 work unit)
+EXPLAIN (COSTS OFF)
+    SELECT count(*) FROM (SELECT a FROM cs_basic WHERE b <> '' OFFSET 0) s;
+
+-- Add second row group + delta → 3 work units >= 2, parallel enabled
+INSERT INTO cs_basic SELECT i, 'rg2-' || i FROM generate_series(200, 250) i;
+VACUUM cs_basic;
+INSERT INTO cs_basic SELECT i, 'delta-' || i FROM generate_series(500, 510) i;
+
+-- Should show Gather over a Parallel ColumnstoreScan (3 work units >= 2)
+EXPLAIN (COSTS OFF)
+    SELECT count(*) FROM (SELECT a FROM cs_basic WHERE b <> '' OFFSET 0) s;
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+
+-- Parallel scan EXPLAIN ANALYZE instrumentation must aggregate across all
+-- participants, not report only the work units the leader happened to claim.
+-- Pull a named counter out of EXPLAIN ANALYZE and confirm the parallel total
+-- equals the serial total -- the value is data-determined and independent of
+-- how many workers actually launch.
+CREATE TABLE cs_instr (a int) USING columnstore;
+INSERT INTO cs_instr SELECT g FROM generate_series(1, 120000) g;
+VACUUM cs_instr;
+CREATE FUNCTION cs_explain_counter(q text, workers int, label text)
+    RETURNS bigint LANGUAGE plpgsql AS $fn$
+DECLARE
+    ln  text;
+    tot bigint := 0;
+BEGIN
+    EXECUTE 'SET max_parallel_workers_per_gather = ' || workers;
+    FOR ln IN
+        EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF) ' || q
+    LOOP
+        IF position(label IN ln) > 0 THEN
+            tot := tot + substring(ln FROM '([0-9]+)\s*$')::bigint;
+        END IF;
+    END LOOP;
+    RESET max_parallel_workers_per_gather;
+    RETURN tot;
+END $fn$;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+-- fence the scan with OFFSET 0 so aggregate pushdown does not mask it; the
+-- predicate prunes one of the two row groups by zone map
+\set iq 'SELECT count(*) FROM (SELECT a FROM cs_instr WHERE a > 115000 OFFSET 0) s'
+SELECT cs_explain_counter(:'iq', 0, 'Row Groups Examined') =
+       cs_explain_counter(:'iq', 2, 'Row Groups Examined') AS examined_matches;
+SELECT cs_explain_counter(:'iq', 0, 'Row Groups Skipped by Zone Map') =
+       cs_explain_counter(:'iq', 2, 'Row Groups Skipped by Zone Map')
+       AS zonemap_skipped_matches;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+DROP FUNCTION cs_explain_counter(text, int, text);
+DROP TABLE cs_instr;
+
 -- Parallel sequential scan with enough row groups
 DROP TABLE cs_basic;
 CREATE TABLE cs_basic (a int, b text) USING columnstore;
@@ -360,6 +435,39 @@ RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 RESET max_parallel_workers_per_gather;
+
+-- sort_key pathkeys: when row groups have non-overlapping ascending
+-- ranges on the sort_key column, the CustomScan path advertises
+-- pathkeys so an upper Sort can be elided on ORDER BY queries.
+CREATE TABLE cs_sk_ordered (a int, b text)
+    USING columnstore WITH (sort_key = 'a');
+-- Append-ordered insert: row group 1 gets a=1..10, row group 2 gets a=11..20
+INSERT INTO cs_sk_ordered SELECT i, 'sk-' || i FROM generate_series(1, 10) i;
+VACUUM cs_sk_ordered;
+INSERT INTO cs_sk_ordered SELECT i, 'sk-' || i FROM generate_series(11, 20) i;
+VACUUM cs_sk_ordered;
+INSERT INTO cs_sk_ordered SELECT i, 'sk-' || i FROM generate_series(21, 30) i;
+VACUUM cs_sk_ordered;
+-- Plan should have no upper Sort node.
+EXPLAIN (COSTS OFF) SELECT a FROM cs_sk_ordered ORDER BY a LIMIT 5;
+SELECT a FROM cs_sk_ordered ORDER BY a LIMIT 5;
+DROP TABLE cs_sk_ordered;
+
+-- sort_key with overlapping row groups: pathkeys must NOT be advertised,
+-- planner must insert an upper Sort.  Inserts span the same value range,
+-- so each row group's [min, max] overlaps the others.
+CREATE TABLE cs_sk_overlap (a int, b text)
+    USING columnstore WITH (sort_key = 'a');
+INSERT INTO cs_sk_overlap SELECT i, 'sk-' || i FROM generate_series(1, 30) i;
+VACUUM cs_sk_overlap;
+INSERT INTO cs_sk_overlap SELECT i, 'sk-' || i FROM generate_series(1, 30) i;
+VACUUM cs_sk_overlap;
+INSERT INTO cs_sk_overlap SELECT i, 'sk-' || i FROM generate_series(1, 30) i;
+VACUUM cs_sk_overlap;
+-- Plan must have an upper Sort node.
+EXPLAIN (COSTS OFF) SELECT a FROM cs_sk_overlap ORDER BY a LIMIT 5;
+SELECT a FROM cs_sk_overlap ORDER BY a LIMIT 5;
+DROP TABLE cs_sk_overlap;
 
 -- Index scan support
 DROP TABLE cs_basic;

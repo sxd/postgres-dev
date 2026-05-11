@@ -3430,6 +3430,9 @@ cs_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 
 	pg_atomic_init_u64(&cpscan->pcs_nallocated, 0);
 
+	pg_atomic_init_u64(&cpscan->pcs_instr_rg_examined, 0);
+	pg_atomic_init_u64(&cpscan->pcs_instr_rg_zonemap_skipped, 0);
+
 	size = sizeof(CSParallelScanDescData);
 	return size;
 }
@@ -3440,6 +3443,9 @@ cs_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
 	CSParallelScanDesc cpscan = (CSParallelScanDesc) pscan;
 
 	pg_atomic_write_u64(&cpscan->pcs_nallocated, 0);
+
+	pg_atomic_write_u64(&cpscan->pcs_instr_rg_examined, 0);
+	pg_atomic_write_u64(&cpscan->pcs_instr_rg_zonemap_skipped, 0);
 }
 
 
@@ -3550,4 +3556,5 @@ _PG_init(void)
 	MarkGUCPrefixReserved("columnstore");
 
 	cs_register_reloptions();
+	cs_register_custom_scan_methods();
 }

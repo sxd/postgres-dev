@@ -22,6 +22,7 @@
 #include "access/heaptoast.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "utils/inval.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
@@ -256,7 +257,15 @@ cs_delta_do_insert(Relation rel, TupleTableSlot *slot, HeapTuple tuple)
 	 * into the current on-disk state (never a full write-back of our stale
 	 * copy; see cs_metapage_merge_insert).
 	 */
-	(void) cs_metapage_merge_insert(rel, new_blkno, 1);
+	if (cs_metapage_merge_insert(rel, new_blkno, 1))
+	{
+		/*
+		 * The delta just became non-empty, which falsifies the "rows arrive
+		 * in row-group order" property cached plans may rely on
+		 * (cs_try_build_sort_pathkeys); make them replan.
+		 */
+		CacheInvalidateRelcache(rel);
+	}
 
 	/* Copy TID back to the slot */
 	ItemPointerCopy(&tid, &slot->tts_tid);
@@ -515,7 +524,11 @@ cs_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 	 * on-disk state (see cs_metapage_merge_insert).  Covering the highest new
 	 * page covers all of them.
 	 */
-	(void) cs_metapage_merge_insert(rel, last_new_blkno, inserted);
+	if (cs_metapage_merge_insert(rel, last_new_blkno, inserted))
+	{
+		/* see cs_delta_do_insert */
+		CacheInvalidateRelcache(rel);
+	}
 }
 
 /*
@@ -605,7 +618,11 @@ cs_delta_insert_tombstone(Relation rel, ItemPointer target_tid,
 	 * adjustment: a tombstone is a delete, not a new row.  When the tombstone
 	 * fit into an existing page this writes nothing at all.
 	 */
-	(void) cs_metapage_merge_insert(rel, new_blkno, 0);
+	if (cs_metapage_merge_insert(rel, new_blkno, 0))
+	{
+		/* see cs_delta_do_insert */
+		CacheInvalidateRelcache(rel);
+	}
 
 	/*
 	 * Invalidate the cached visibility info so that index-only scans see the
