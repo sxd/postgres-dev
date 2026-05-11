@@ -18,13 +18,20 @@
 #include "cs_internal.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/nbtree.h"
+#include "catalog/pg_am_d.h"
+#include "commands/defrem.h"
 #include "common/pg_lzcompress.h"
+#include "lib/bloomfilter.h"
 #include "nodes/bitmapset.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "utils/array.h"
 #include "utils/datum.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/numeric.h"
+#include "utils/pg_locale.h"
 #include "utils/snapmgr.h"
 
 #ifdef USE_LZ4
@@ -250,6 +257,20 @@ static void cs_ensure_column_loaded_internal(CSColumnCache *cache,
 											 Relation rel, int col);
 static void cs_base_decompress_column_internal(CSColumnCache *cache,
 											   Relation rel, int col);
+static void cs_zonemap_init_cmp_cache(CScanDesc scan);
+static bool cs_zonemap_skip_rowgroup(CScanDesc scan, CSRowGroupDesc *rg_desc);
+static void cs_init_array_scan_keys(CScanDesc scan);
+static Datum cs_cache_get_value(CSColumnCache *cache, TupleDesc tupdesc,
+								int col, uint32 row, bool *isnull);
+static void cs_build_dict_match_arrays(CScanDesc scan, CSColumnCache *cache,
+									   TupleDesc tupdesc);
+static bool cs_row_passes_scan_keys(CScanDesc scan, CSColumnCache *cache,
+									uint32 row);
+static void cs_preload_qual_columns(CScanDesc scan, CSColumnCache *cache,
+									Relation rel);
+static void cs_build_selection_bitmap(CScanDesc scan, CSColumnCache *cache,
+									  Relation rel);
+
 
 /*
  * Convert a scaled int64 to Numeric in a caller-provided buffer.
@@ -431,6 +452,13 @@ cs_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKeyData *key,
 	scan->needed_col_count = 0;
 	scan->rg_desc_preloaded = false;
 
+	/* Scan key and zone map state */
+	scan->cs_nkeys = 0;
+	scan->cs_keys = NULL;
+	scan->zm_cmp_finfo = NULL;
+	scan->zm_cmp_collation = NULL;
+	scan->zm_cmp_initialized = false;
+
 	/* Column buffers allocated on demand during columnar scan */
 	memset(&scan->colcache, 0, sizeof(CSColumnCache));
 	scan->colcache.cc_cxt =
@@ -573,6 +601,30 @@ cs_scan_end(TableScanDesc sscan)
 		bms_free(scan->needed_cols);
 	if (scan->needed_col_list)
 		pfree(scan->needed_col_list);
+	if (scan->cs_keys)
+		pfree(scan->cs_keys);
+	if (scan->zm_cmp_finfo)
+		pfree(scan->zm_cmp_finfo);
+	if (scan->zm_cmp_collation)
+		pfree(scan->zm_cmp_collation);
+	if (scan->sa_nelem)
+		pfree(scan->sa_nelem);
+	if (scan->sa_elem_values)
+		pfree(scan->sa_elem_values);
+	if (scan->sa_elem_nulls)
+		pfree(scan->sa_elem_nulls);
+	if (scan->dk_match)
+	{
+		for (int i = 0; i < scan->cs_nkeys; i++)
+		{
+			if (scan->dk_match[i])
+				pfree(scan->dk_match[i]);
+		}
+		pfree(scan->dk_match);
+	}
+
+	/* Clean up bloom filter state */
+	cs_scan_set_bloom_filter((TableScanDesc) scan, 0, NULL);
 
 	/*
 	 * All cache-lifetime scan state (column data, bitmaps, tombstones) lives
@@ -610,6 +662,14 @@ cs_scan_rescan(TableScanDesc sscan, ScanKeyData *key,
 	scan->cur_rowgroup = 0;
 	scan->cur_row_in_group = 0;
 	scan->colcache.col_nrows = 0;
+
+	if (scan->colcache.cur_delbitmap)
+	{
+		pfree(scan->colcache.cur_delbitmap);
+		scan->colcache.cur_delbitmap = NULL;
+	}
+
+	scan->sel_bitmap_valid = false;
 
 	if (key)
 		sscan->rs_key = key;
@@ -654,6 +714,1586 @@ cs_scan_set_projection(TableScanDesc sscan, Bitmapset *needed_cols)
 	col = -1;
 	while ((col = bms_next_member(needed_cols, col)) >= 0)
 		scan->needed_col_list[scan->needed_col_count++] = col;
+}
+
+/*
+ * Store scan keys pushed down by the CustomScan layer for zone map
+ * filtering.  We copy the keys because the caller frees its
+ * ScanKeyData array immediately after this returns.
+ */
+void
+cs_scan_set_qual_keys(TableScanDesc sscan, int nkeys, ScanKeyData *keys)
+{
+	CScanDesc	scan = (CScanDesc) sscan;
+
+	if (scan->cs_keys)
+		pfree(scan->cs_keys);
+
+	if (nkeys > 0)
+	{
+		scan->cs_keys = palloc(sizeof(ScanKeyData) * nkeys);
+		memcpy(scan->cs_keys, keys, sizeof(ScanKeyData) * nkeys);
+	}
+	else
+		scan->cs_keys = NULL;
+
+	scan->cs_nkeys = nkeys;
+
+	/*
+	 * Build the comparison cache now, in the caller's (executor-lifetime)
+	 * memory context: the scan loops that consult it can run inside a
+	 * short-lived per-row context that must not own scan state.
+	 */
+	scan->zm_cmp_initialized = false;
+	if (scan->zm_cmp_finfo)
+	{
+		pfree(scan->zm_cmp_finfo);
+		scan->zm_cmp_finfo = NULL;
+	}
+	if (scan->zm_cmp_collation)
+	{
+		pfree(scan->zm_cmp_collation);
+		scan->zm_cmp_collation = NULL;
+	}
+	/* No row groups means the cache could never be consulted */
+	if (nkeys > 0 && scan->nrowgroups > 0)
+		cs_zonemap_init_cmp_cache(scan);
+}
+
+/*
+ * Initialize the comparison function cache for zone map evaluation.
+ *
+ * For each scan key, look up the btree comparison function for the
+ * column's type.  This is done lazily on first use.
+ */
+static void
+cs_zonemap_init_cmp_cache(CScanDesc scan)
+{
+	Relation	rel = scan->rs_base.rs_rd;
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	int			nkeys = scan->cs_nkeys;
+
+	scan->zm_cmp_finfo = palloc0(sizeof(FmgrInfo) * nkeys);
+	scan->zm_cmp_collation = palloc0(sizeof(Oid) * nkeys);
+
+	for (int i = 0; i < nkeys; i++)
+	{
+		ScanKey		key = &scan->cs_keys[i];
+		AttrNumber	attno = key->sk_attno;
+		Form_pg_attribute attr;
+		Oid			opclass;
+		Oid			opfamily;
+		Oid			opcintype;
+		Oid			right_type;
+		Oid			cmp_proc;
+
+		if (attno < 1 || attno > tupdesc->natts)
+			continue;
+
+		attr = TupleDescAttr(tupdesc, attno - 1);
+		opclass = GetDefaultOpClass(attr->atttypid, BTREE_AM_OID);
+		if (!OidIsValid(opclass))
+			continue;
+
+		opfamily = get_opclass_family(opclass);
+		opcintype = get_opclass_input_type(opclass);
+
+		/* The scan key's right-hand side type */
+		right_type = key->sk_subtype;
+		if (!OidIsValid(right_type))
+			right_type = opcintype;
+
+		cmp_proc = get_opfamily_proc(opfamily, opcintype,
+									 right_type, BTORDER_PROC);
+		if (OidIsValid(cmp_proc))
+		{
+			fmgr_info(cmp_proc, &scan->zm_cmp_finfo[i]);
+			scan->zm_cmp_collation[i] = attr->attcollation;
+		}
+	}
+
+	scan->zm_cmp_initialized = true;
+}
+
+/*
+ * Lazily initialize deconstructed array elements for SK_SEARCHARRAY scan keys.
+ * Called once per scan, not per row group.
+ */
+static void
+cs_init_array_scan_keys(CScanDesc scan)
+{
+	int			nkeys = scan->cs_nkeys;
+
+	scan->dk_match = palloc0(sizeof(bool *) * nkeys);
+	scan->sa_nelem = palloc0(sizeof(int) * nkeys);
+	scan->sa_elem_values = palloc0(sizeof(Datum *) * nkeys);
+	scan->sa_elem_nulls = palloc0(sizeof(bool *) * nkeys);
+	scan->dk_match_rg = UINT32_MAX;
+
+	for (int i = 0; i < nkeys; i++)
+	{
+		ScanKey		key = &scan->cs_keys[i];
+		ArrayType  *arrayval;
+		Oid			elemtype;
+		int16		typlen;
+		bool		typbyval;
+		char		typalign;
+		int			nelems;
+		Datum	   *elem_values;
+		bool	   *elem_nulls;
+
+		if (!(key->sk_flags & SK_SEARCHARRAY))
+			continue;
+
+		arrayval = DatumGetArrayTypeP(key->sk_argument);
+		elemtype = ARR_ELEMTYPE(arrayval);
+		get_typlenbyvalalign(elemtype, &typlen, &typbyval, &typalign);
+		deconstruct_array(arrayval, elemtype, typlen, typbyval, typalign,
+						  &elem_values, &elem_nulls, &nelems);
+
+		scan->sa_nelem[i] = nelems;
+		scan->sa_elem_values[i] = elem_values;
+		scan->sa_elem_nulls[i] = elem_nulls;
+	}
+
+	scan->sa_initialized = true;
+}
+
+/*
+ * Retrieve a single value from the column cache for row-level filtering.
+ *
+ * Handles dictionary-encoded, varlen (col_values), and fixed-width by-value
+ * (raw_data / NI64) columns.  The column must already be loaded via
+ * cs_ensure_column_loaded().
+ */
+static Datum
+cs_cache_get_value(CSColumnCache *cache, TupleDesc tupdesc,
+				   int col, uint32 row, bool *isnull)
+{
+	/* Dictionary-encoded column */
+	if (cache->col_dict && cache->col_dict[col] != NULL)
+	{
+		CSDictColumn *dict = cache->col_dict[col];
+		uint32		idx;
+
+		switch (dict->index_width)
+		{
+			case 1:
+				idx = ((uint8 *) dict->index_data)[row];
+				break;
+			case 2:
+				idx = cs_read_u16((const char *) dict->index_data + (Size) (row) * sizeof(uint16));
+				break;
+			default:
+				idx = cs_read_u32((const char *) dict->index_data + (Size) (row) * sizeof(uint32));
+				break;
+		}
+
+		if (dict->has_null && idx == dict->dict_count)
+		{
+			*isnull = true;
+			return (Datum) 0;
+		}
+		*isnull = false;
+		return dict->dict_values[idx];
+	}
+
+	/* Variable-length column (Datum/bool arrays) */
+	if (cache->col_values[col] != NULL)
+	{
+		*isnull = cache->col_nulls[col][row];
+		return cache->col_values[col][row];
+	}
+
+	/* Fixed-width by-value column or NUMERIC_INT64 (raw data) */
+	{
+		CompactAttribute *att = TupleDescCompactAttr(tupdesc, col);
+
+		if (cache->col_null_bitmap[col] != NULL)
+		{
+			if (CS_ISNULL(cache->col_null_bitmap[col], row))
+			{
+				*isnull = true;
+				return (Datum) 0;
+			}
+		}
+
+		*isnull = false;
+
+		/*
+		 * NI64 is identified by the conversion buffer, not dscale > 0 --
+		 * whole-number columns are encoded with dscale 0
+		 */
+		if (cache->col_ni64_buf[col] != NULL)
+		{
+			int64		ival = ((int64 *) cache->col_raw_data[col])[row];
+
+			return cs_int64_to_numeric_buf(ival,
+										   (int) cache->col_ni64_dscale[col],
+										   cache->col_ni64_buf[col]);
+		}
+		return cs_fetch_att(cache->col_raw_data[col] +
+							(Size) row * att->attlen,
+							true, att->attlen);
+	}
+}
+
+/*
+ * Build dictionary code match arrays for scan keys on dict-encoded columns
+ * in the current row group.  Handles both SK_SEARCHARRAY (= ANY) and simple
+ * BTEqual keys.
+ */
+static void
+cs_build_dict_match_arrays(CScanDesc scan, CSColumnCache *cache,
+						   TupleDesc tupdesc)
+{
+	int			nkeys = scan->cs_nkeys;
+	ScanKeyData *keys = scan->cs_keys;
+
+	for (int i = 0; i < nkeys; i++)
+	{
+		ScanKey		key = &keys[i];
+		int			col = key->sk_attno - 1;
+		CSDictColumn *dict;
+		FmgrInfo   *cmp;
+		Oid			collation;
+		bool	   *match;
+		bool		is_array = (key->sk_flags & SK_SEARCHARRAY) != 0;
+		bool		is_equal = (key->sk_strategy == BTEqualStrategyNumber);
+
+		/* Free previous match array if any */
+		if (scan->dk_match[i])
+		{
+			pfree(scan->dk_match[i]);
+			scan->dk_match[i] = NULL;
+		}
+
+		/* Only handle array keys and simple equality keys */
+		if (!is_array && !is_equal)
+			continue;
+		if (col < 0 || col >= tupdesc->natts)
+			continue;
+		if (!cache->col_dict || cache->col_dict[col] == NULL)
+			continue;
+
+		dict = cache->col_dict[col];
+		cmp = &scan->zm_cmp_finfo[i];
+		if (!OidIsValid(cmp->fn_oid))
+			continue;
+
+		collation = scan->zm_cmp_collation[i];
+
+		/*
+		 * This array is rebuilt once per row group and reused across the
+		 * group's rows, so it must outlive whatever (possibly per-row,
+		 * reset-between-rows) context the scan callback was entered with.
+		 * Allocate it in the cache context, like the selection bitmap; see
+		 * cs_cache_alloc.
+		 */
+		match = MemoryContextAllocZero(cache->cc_cxt ? cache->cc_cxt
+									   : CurrentMemoryContext,
+									   sizeof(bool) * (dict->dict_count + 1));
+
+		if (is_array)
+		{
+			int			nelems = scan->sa_nelem[i];
+			Datum	   *elem_values = scan->sa_elem_values[i];
+			bool	   *elem_nulls = scan->sa_elem_nulls[i];
+
+			for (int d = 0; d < dict->dict_count; d++)
+			{
+				for (int e = 0; e < nelems; e++)
+				{
+					int			cmp_result;
+
+					if (elem_nulls[e])
+						continue;
+
+					cmp_result = DatumGetInt32(
+											   FunctionCall2Coll(cmp, collation,
+																 dict->dict_values[d],
+																 elem_values[e]));
+					if (cmp_result == 0)
+					{
+						match[d] = true;
+						break;
+					}
+				}
+			}
+		}
+		else
+		{
+			/* Simple equality: col = const */
+			if (key->sk_flags & SK_ISNULL)
+				goto set_match;
+
+			for (int d = 0; d < dict->dict_count; d++)
+			{
+				int			cmp_result;
+
+				cmp_result = DatumGetInt32(
+										   FunctionCall2Coll(cmp, collation,
+															 dict->dict_values[d],
+															 key->sk_argument));
+
+				/*
+				 * No early break: the dictionary dedups by byte image, so
+				 * several entries can be btree-equal to the argument (float
+				 * +0.0/-0.0, numeric 1.0/1.00); all of them match.
+				 */
+				if (cmp_result == 0)
+					match[d] = true;
+			}
+		}
+
+set_match:
+		/* NULL dict index (dict_count) never matches */
+		scan->dk_match[i] = match;
+	}
+
+	scan->dk_match_rg = scan->cur_rowgroup;
+}
+
+/*
+ * Test whether a datum value is absent from a bloom filter, hashing the
+ * actual data bytes appropriate to the type (by-value, varlena, or
+ * fixed-length by-reference).
+ */
+static inline bool
+bloom_lacks_datum(bloom_filter *filter, Datum val, Form_pg_attribute attr)
+{
+	if (attr->attbyval)
+		return bloom_lacks_element(filter,
+								   (unsigned char *) &val, sizeof(Datum));
+	else if (attr->attlen == -1)
+	{
+		void	   *ptr = DatumGetPointer(val);
+
+		return bloom_lacks_element(filter,
+								   (unsigned char *) VARDATA_ANY(ptr),
+								   VARSIZE_ANY_EXHDR(ptr));
+	}
+	else
+		return bloom_lacks_element(filter,
+								   (unsigned char *) DatumGetPointer(val),
+								   attr->attlen);
+}
+
+/*
+ * Evaluate pushed-down scan keys against a single row in the column cache.
+ *
+ * Returns true if the row passes all scan keys (or there are no keys).
+ * Uses the same btree comparison functions cached for zone map evaluation.
+ * For dict-encoded columns, uses pre-computed match arrays for fast lookup.
+ */
+static bool
+cs_row_passes_scan_keys(CScanDesc scan, CSColumnCache *cache, uint32 row)
+{
+	Relation	rel = scan->rs_base.rs_rd;
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	int			nkeys = scan->cs_nkeys;
+	ScanKeyData *keys = scan->cs_keys;
+	bool		have_scan_keys = (nkeys > 0 && keys != NULL);
+
+	if (!have_scan_keys && scan->bf_nfilters == 0)
+		return true;
+
+	if (have_scan_keys)
+	{
+		/* Lazily initialize comparison function cache (shared with zone maps) */
+		if (!scan->zm_cmp_initialized)
+			cs_zonemap_init_cmp_cache(scan);
+
+		/* Lazily deconstruct array arguments for SK_SEARCHARRAY keys */
+		if (!scan->sa_initialized)
+			cs_init_array_scan_keys(scan);
+
+		/* Rebuild dict match arrays when the row group changes */
+		if (scan->dk_match_rg != scan->cur_rowgroup)
+			cs_build_dict_match_arrays(scan, cache, tupdesc);
+	}
+
+	if (have_scan_keys)
+	{
+		for (int i = 0; i < nkeys; i++)
+		{
+			ScanKey		key = &keys[i];
+			int			col = key->sk_attno - 1;
+			FmgrInfo   *cmp;
+			Oid			collation;
+			Datum		val;
+			bool		isnull;
+			int			cmp_result;
+
+			if (col < 0 || col >= tupdesc->natts)
+				continue;
+
+			/* IS NULL / IS NOT NULL: test the row's null status */
+			if (key->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL))
+			{
+				bool		row_isnull;
+
+				cs_ensure_column_loaded(cache, rel, col);
+				cs_cache_get_value(cache, tupdesc, col, row, &row_isnull);
+
+				if (key->sk_flags & SK_SEARCHNULL)
+				{
+					if (!row_isnull)
+						return false;
+				}
+				else
+				{
+					if (row_isnull)
+						return false;
+				}
+				continue;
+			}
+
+			/* Skip keys with NULL argument (but not SK_SEARCHARRAY) */
+			if ((key->sk_flags & SK_ISNULL) && !(key->sk_flags & SK_SEARCHARRAY))
+				return false;
+
+			/* Ensure the qual column is decompressed */
+			cs_ensure_column_loaded(cache, rel, col);
+
+			/*
+			 * Fast path for dict-encoded columns with a pre-computed match
+			 * array (both SK_SEARCHARRAY and simple BTEqual keys).
+			 */
+			if (scan->dk_match[i])
+			{
+				CSDictColumn *dict = cache->col_dict[col];
+				uint32		idx;
+
+				switch (dict->index_width)
+				{
+					case 1:
+						idx = ((uint8 *) dict->index_data)[row];
+						break;
+					case 2:
+						idx = cs_read_u16((const char *) dict->index_data + (Size) (row) * sizeof(uint16));
+						break;
+					default:
+						idx = cs_read_u32((const char *) dict->index_data + (Size) (row) * sizeof(uint32));
+						break;
+				}
+
+				/* NULL dict entry (idx == dict_count) never matches */
+				if (dict->has_null && idx == dict->dict_count)
+					return false;
+
+				if (!scan->dk_match[i][idx])
+					return false;
+
+				continue;
+			}
+
+			/*
+			 * Slow path for SK_SEARCHARRAY on non-dict columns: get the row
+			 * value and compare against each array element.
+			 */
+			if (key->sk_flags & SK_SEARCHARRAY)
+			{
+				int			nelems = scan->sa_nelem[i];
+				Datum	   *elem_values = scan->sa_elem_values[i];
+				bool	   *elem_nulls = scan->sa_elem_nulls[i];
+				bool		found = false;
+
+				cmp = &scan->zm_cmp_finfo[i];
+				if (!OidIsValid(cmp->fn_oid))
+					elog(ERROR, "columnstore: no comparison function for pushed scan key %d", i);
+
+				val = cs_cache_get_value(cache, tupdesc, col, row, &isnull);
+				if (isnull)
+					return false;
+
+				collation = scan->zm_cmp_collation[i];
+				for (int e = 0; e < nelems; e++)
+				{
+					if (elem_nulls[e])
+						continue;
+					cmp_result = DatumGetInt32(
+											   FunctionCall2Coll(cmp, collation,
+																 val, elem_values[e]));
+					if (cmp_result == 0)
+					{
+						found = true;
+						break;
+					}
+				}
+
+				if (!found)
+					return false;
+
+				continue;
+			}
+
+			/* Skip columns without a cached comparison function */
+			cmp = &scan->zm_cmp_finfo[i];
+			if (!OidIsValid(cmp->fn_oid))
+				continue;
+
+			/* Get the row's value */
+			val = cs_cache_get_value(cache, tupdesc, col, row, &isnull);
+
+			/* NULL fails all comparisons */
+			if (isnull)
+				return false;
+
+			collation = scan->zm_cmp_collation[i];
+			cmp_result = DatumGetInt32(FunctionCall2Coll(cmp, collation,
+														 val,
+														 key->sk_argument));
+
+			switch (key->sk_strategy)
+			{
+				case BTLessStrategyNumber:
+					if (cmp_result >= 0)
+						return false;
+					break;
+				case BTLessEqualStrategyNumber:
+					if (cmp_result > 0)
+						return false;
+					break;
+				case BTEqualStrategyNumber:
+					if (cmp_result != 0)
+						return false;
+					break;
+				case BTGreaterEqualStrategyNumber:
+					if (cmp_result < 0)
+						return false;
+					break;
+				case BTGreaterStrategyNumber:
+					if (cmp_result <= 0)
+						return false;
+					break;
+				default:
+					break;
+			}
+		}
+	}
+
+	/* Bloom filter check */
+	for (int f = 0; f < scan->bf_nfilters; f++)
+	{
+		int			bf_col = scan->bf_attnos[f] - 1;
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, bf_col);
+		Datum		val;
+		bool		isnull;
+
+		cs_ensure_column_loaded(cache, rel, bf_col);
+
+		/* Dict-encoded: use precomputed match array */
+		if (cache->col_dict && cache->col_dict[bf_col] != NULL)
+		{
+			CSDictColumn *dict = cache->col_dict[bf_col];
+			uint32		idx;
+
+			/* Build bloom dict match array once per row group */
+			if (scan->bf_dk_match_rg[f] != scan->cur_rowgroup)
+			{
+				if (scan->bf_dk_match[f])
+					pfree(scan->bf_dk_match[f]);
+
+				scan->bf_dk_match[f] = palloc0(sizeof(bool) * (dict->dict_count + 1));
+
+				for (int d = 0; d < dict->dict_count; d++)
+				{
+					if (!bloom_lacks_datum(scan->bf_filters[f],
+										   dict->dict_values[d], attr))
+						scan->bf_dk_match[f][d] = true;
+				}
+
+				scan->bf_dk_match_rg[f] = scan->cur_rowgroup;
+			}
+
+			switch (dict->index_width)
+			{
+				case 1:
+					idx = ((uint8 *) dict->index_data)[row];
+					break;
+				case 2:
+					idx = cs_read_u16((const char *) dict->index_data + (Size) (row) * sizeof(uint16));
+					break;
+				default:
+					idx = cs_read_u32((const char *) dict->index_data + (Size) (row) * sizeof(uint32));
+					break;
+			}
+
+			if (!scan->bf_dk_match[f][idx])
+				return false;
+		}
+		else
+		{
+			/* Raw column: test each row individually */
+			val = cs_cache_get_value(cache, tupdesc, bf_col, row, &isnull);
+
+			if (isnull)
+				return false;
+
+			if (bloom_lacks_datum(scan->bf_filters[f], val, attr))
+				return false;
+		}
+	}
+
+	return true;
+}
+
+/*
+ * Pre-load (decompress) all columns referenced by scan keys.
+ *
+ * Called once per row group when scan keys are present, so that
+ * cs_row_passes_scan_keys() can evaluate filter predicates without
+ * triggering decompression on every row.
+ */
+static void
+cs_preload_qual_columns(CScanDesc scan, CSColumnCache *cache, Relation rel)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+
+	for (int i = 0; i < scan->cs_nkeys; i++)
+	{
+		int			col = scan->cs_keys[i].sk_attno - 1;
+
+		if (col >= 0 && col < tupdesc->natts)
+			cs_ensure_column_loaded(cache, rel, col);
+	}
+
+	/* Also preload bloom filter columns */
+	for (int f = 0; f < scan->bf_nfilters; f++)
+	{
+		int			bf_col = scan->bf_attnos[f] - 1;
+
+		if (bf_col >= 0 && bf_col < tupdesc->natts)
+			cs_ensure_column_loaded(cache, rel, bf_col);
+	}
+}
+
+/*
+ * Apply a dictionary match array to the selection bitmap.
+ * Deselects rows whose dictionary code does not appear in the match table.
+ */
+static void
+cs_sel_bitmap_apply_dict(char *sel_bitmap, CSDictColumn *dict,
+						 bool *match, uint32 nrows)
+{
+	switch (dict->index_width)
+	{
+		case 1:
+			{
+				uint8	   *idx = (uint8 *) dict->index_data;
+
+				for (uint32 i = 0; i < nrows; i++)
+				{
+					if (CS_ISSELECTED(sel_bitmap, i) && !match[idx[i]])
+						CS_DESELECT_ROW(sel_bitmap, i);
+				}
+			}
+			break;
+		case 2:
+			{
+				char	   *idx = (char *) dict->index_data;
+
+				for (uint32 i = 0; i < nrows; i++)
+				{
+					if (CS_ISSELECTED(sel_bitmap, i) &&
+						!match[cs_read_u16(idx + (Size) i * sizeof(uint16))])
+						CS_DESELECT_ROW(sel_bitmap, i);
+				}
+			}
+			break;
+		default:
+			{
+				char	   *idx = (char *) dict->index_data;
+
+				for (uint32 i = 0; i < nrows; i++)
+				{
+					if (CS_ISSELECTED(sel_bitmap, i) &&
+						!match[cs_read_u32(idx + (Size) i * sizeof(uint32))])
+						CS_DESELECT_ROW(sel_bitmap, i);
+				}
+			}
+			break;
+	}
+}
+
+/*
+ * Check whether a type OID is eligible for the fast integer comparison path.
+ * Returns the signed comparison width (2, 4, or 8), or 0 if ineligible.
+ */
+static int
+cs_fast_int_width(Oid typid)
+{
+	switch (typid)
+	{
+		case INT2OID:
+			return 2;
+		case INT4OID:
+		case DATEOID:
+			return 4;
+		case INT8OID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			return 8;
+		default:
+			return 0;
+	}
+}
+
+/*
+ * Apply a fast integer comparison to the selection bitmap.
+ * Deselects rows that fail the btree-strategy comparison against sk_argument.
+ * The null bitmap must already be AND'd into sel_bitmap before calling.
+ */
+static void
+cs_sel_bitmap_apply_int(char *sel_bitmap, char *raw_data, uint32 nrows,
+						int width, int strategy, Datum sk_argument)
+{
+	uint32		i;
+
+	switch (width)
+	{
+		case 2:
+			{
+				int16	   *data = (int16 *) raw_data;
+				int16		val = DatumGetInt16(sk_argument);
+
+				switch (strategy)
+				{
+					case BTLessStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] >= val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTLessEqualStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] > val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTEqualStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] != val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTGreaterEqualStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] < val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTGreaterStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] <= val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+				}
+			}
+			break;
+
+		case 4:
+			{
+				int32	   *data = (int32 *) raw_data;
+				int32		val = DatumGetInt32(sk_argument);
+
+				switch (strategy)
+				{
+					case BTLessStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] >= val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTLessEqualStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] > val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTEqualStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] != val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTGreaterEqualStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] < val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTGreaterStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] <= val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+				}
+			}
+			break;
+
+		case 8:
+			{
+				int64	   *data = (int64 *) raw_data;
+				int64		val = DatumGetInt64(sk_argument);
+
+				switch (strategy)
+				{
+					case BTLessStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] >= val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTLessEqualStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] > val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTEqualStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] != val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTGreaterEqualStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] < val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+					case BTGreaterStrategyNumber:
+						for (i = 0; i < nrows; i++)
+							if (CS_ISSELECTED(sel_bitmap, i) && data[i] <= val)
+								CS_DESELECT_ROW(sel_bitmap, i);
+						break;
+				}
+			}
+			break;
+	}
+}
+
+/*
+ * Apply null bitmap to selection bitmap.
+ * For IS NULL: keep only rows where the column IS NULL.
+ * For IS NOT NULL: keep only rows where the column IS NOT NULL.
+ * For normal predicates: deselect null rows (nulls fail all comparisons).
+ *
+ * The null bitmap convention: bit=1 means NOT NULL (present).
+ */
+static void
+cs_sel_bitmap_apply_nulls(char *sel_bitmap, char *null_bitmap,
+						  uint32 nrows, bool want_null)
+{
+	uint32		nbytes = CS_DELBITMAP_BYTES(nrows);
+
+	if (null_bitmap == NULL)
+	{
+		/* No nulls in this column */
+		if (want_null)
+			memset(sel_bitmap, 0, nbytes);	/* IS NULL: nothing matches */
+		/* IS NOT NULL or normal: nothing to do, all rows are present */
+	}
+	else if (want_null)
+	{
+		/* IS NULL: keep only null rows (invert null bitmap) */
+		for (uint32 b = 0; b < nbytes; b++)
+			sel_bitmap[b] &= ~null_bitmap[b];
+	}
+	else
+	{
+		/* IS NOT NULL or normal predicate: deselect null rows */
+		for (uint32 b = 0; b < nbytes; b++)
+			sel_bitmap[b] &= null_bitmap[b];
+	}
+}
+
+/*
+ * Build a selection bitmap for the current row group.
+ *
+ * The bitmap has one bit per row: bit set = passes all quals, bit clear =
+ * filtered out.  It incorporates the deletion bitmap and all pushed-down
+ * predicates (scan keys and bloom filters), so the inner scan loop only
+ * needs to test bits and check tombstones.
+ *
+ * For fixed-width integer types the comparison is done in tight loops
+ * over contiguous column arrays, enabling compiler auto-vectorization.
+ * Dictionary-encoded columns use pre-computed match arrays.  Other types
+ * fall back to per-row FunctionCall2Coll evaluation.
+ *
+ * Must be called after cs_preload_qual_columns() has decompressed all
+ * qual columns for the current row group.
+ */
+static void
+cs_build_selection_bitmap(CScanDesc scan, CSColumnCache *cache, Relation rel)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	uint32		nrows = cache->col_nrows;
+	uint32		nbytes = CS_DELBITMAP_BYTES(nrows);
+	int			nkeys = scan->cs_nkeys;
+	ScanKeyData *keys = scan->cs_keys;
+
+	/*
+	 * Allocate or reuse the bitmap; it is reused across row groups, so it
+	 * must not live in whatever per-row context the caller has current
+	 */
+	if (scan->sel_bitmap == NULL || scan->sel_bitmap_nrows < nrows)
+	{
+		if (scan->sel_bitmap)
+			pfree(scan->sel_bitmap);
+		scan->sel_bitmap = cs_cache_alloc(&scan->colcache, nbytes);
+		scan->sel_bitmap_nrows = nrows;
+	}
+
+	/* Start with all rows selected */
+	memset(scan->sel_bitmap, 0xFF, nbytes);
+
+	/* AND in deletion bitmap (convention: bit=1 means deleted, so invert) */
+	if (cache->cur_delbitmap != NULL)
+	{
+		for (uint32 b = 0; b < nbytes; b++)
+			scan->sel_bitmap[b] &= ~cache->cur_delbitmap[b];
+	}
+
+	/* Ensure lazy-init state is ready */
+	if (nkeys > 0 && keys != NULL)
+	{
+		if (!scan->zm_cmp_initialized)
+			cs_zonemap_init_cmp_cache(scan);
+		if (!scan->sa_initialized)
+			cs_init_array_scan_keys(scan);
+		if (scan->dk_match_rg != scan->cur_rowgroup)
+			cs_build_dict_match_arrays(scan, cache, tupdesc);
+	}
+
+	/* Apply each scan key to the bitmap */
+	for (int i = 0; i < nkeys; i++)
+	{
+		ScanKey		key = &keys[i];
+		int			col = key->sk_attno - 1;
+		Form_pg_attribute attr;
+		char	   *null_bitmap;
+
+		if (col < 0 || col >= tupdesc->natts)
+			continue;
+
+		attr = TupleDescAttr(tupdesc, col);
+
+		/* IS NULL / IS NOT NULL */
+		if (key->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL))
+		{
+			bool		want_null = (key->sk_flags & SK_SEARCHNULL) != 0;
+
+			if (cache->col_dict && cache->col_dict[col] != NULL)
+			{
+				/*
+				 * Dict-encoded: build a match array where only the null
+				 * sentinel (or non-null entries) match.
+				 */
+				CSDictColumn *dict = cache->col_dict[col];
+				bool	   *match = palloc0(sizeof(bool) * (dict->dict_count + 1));
+
+				if (want_null)
+					match[dict->dict_count] = true; /* only null matches */
+				else
+				{
+					for (int d = 0; d < dict->dict_count; d++)
+						match[d] = true;	/* all non-null match */
+				}
+				cs_sel_bitmap_apply_dict(scan->sel_bitmap, dict, match, nrows);
+				pfree(match);
+			}
+			else if (cache->col_values[col] != NULL)
+			{
+				/*
+				 * Variable-length column: nulls are in a bool array
+				 * (col_nulls[col][row]), not a bit-packed bitmap.
+				 */
+				bool	   *nulls = cache->col_nulls[col];
+
+				for (uint32 row = 0; row < nrows; row++)
+				{
+					if (!CS_ISSELECTED(scan->sel_bitmap, row))
+						continue;
+					if (want_null && !nulls[row])
+						CS_DESELECT_ROW(scan->sel_bitmap, row);
+					else if (!want_null && nulls[row])
+						CS_DESELECT_ROW(scan->sel_bitmap, row);
+				}
+			}
+			else
+			{
+				null_bitmap = cache->col_null_bitmap[col];
+				cs_sel_bitmap_apply_nulls(scan->sel_bitmap, null_bitmap,
+										  nrows, want_null);
+			}
+			continue;
+		}
+
+		/* NULL scan argument (not SK_SEARCHARRAY) fails all rows */
+		if ((key->sk_flags & SK_ISNULL) && !(key->sk_flags & SK_SEARCHARRAY))
+		{
+			memset(scan->sel_bitmap, 0, nbytes);
+			break;
+		}
+
+		/* Dictionary fast path */
+		if (scan->dk_match[i])
+		{
+			cs_sel_bitmap_apply_dict(scan->sel_bitmap,
+									 cache->col_dict[col],
+									 scan->dk_match[i], nrows);
+			continue;
+		}
+
+		/*
+		 * Fast integer comparison path: eligible for by-value fixed-width
+		 * integer types that are not dict-encoded, not NI64, and not
+		 * SK_SEARCHARRAY, with no cross-type comparison.
+		 */
+		if (!(key->sk_flags & SK_SEARCHARRAY) &&
+			attr->attbyval && attr->attlen > 0 &&
+			cache->col_dict[col] == NULL &&
+			cache->col_ni64_dscale[col] == 0 &&
+			(!OidIsValid(key->sk_subtype) ||
+			 key->sk_subtype == attr->atttypid))
+		{
+			int			width = cs_fast_int_width(attr->atttypid);
+
+			if (width > 0 && cache->col_raw_data[col] != NULL)
+			{
+				/* Deselect null rows first */
+				null_bitmap = cache->col_null_bitmap[col];
+				if (null_bitmap != NULL)
+					cs_sel_bitmap_apply_nulls(scan->sel_bitmap, null_bitmap,
+											  nrows, false);
+
+				cs_sel_bitmap_apply_int(scan->sel_bitmap,
+										cache->col_raw_data[col], nrows,
+										width, key->sk_strategy,
+										key->sk_argument);
+				continue;
+			}
+		}
+
+		/* Fallback: per-row evaluation using FunctionCall2Coll */
+		{
+			FmgrInfo   *cmp = &scan->zm_cmp_finfo[i];
+
+			if (!OidIsValid(cmp->fn_oid) && !(key->sk_flags & SK_SEARCHARRAY))
+				continue;
+
+			for (uint32 row = 0; row < nrows; row++)
+			{
+				Datum		val;
+				bool		isnull;
+				int			cmp_result;
+
+				if (!CS_ISSELECTED(scan->sel_bitmap, row))
+					continue;
+
+				val = cs_cache_get_value(cache, tupdesc, col, row, &isnull);
+				if (isnull)
+				{
+					CS_DESELECT_ROW(scan->sel_bitmap, row);
+					continue;
+				}
+
+				if (key->sk_flags & SK_SEARCHARRAY)
+				{
+					int			nelems = scan->sa_nelem[i];
+					Datum	   *elem_values = scan->sa_elem_values[i];
+					bool	   *elem_nulls = scan->sa_elem_nulls[i];
+					bool		found = false;
+					Oid			collation = scan->zm_cmp_collation[i];
+
+					for (int e = 0; e < nelems; e++)
+					{
+						if (elem_nulls[e])
+							continue;
+						cmp_result = DatumGetInt32(
+												   FunctionCall2Coll(cmp, collation,
+																	 val, elem_values[e]));
+						if (cmp_result == 0)
+						{
+							found = true;
+							break;
+						}
+					}
+					if (!found)
+						CS_DESELECT_ROW(scan->sel_bitmap, row);
+				}
+				else
+				{
+					Oid			collation = scan->zm_cmp_collation[i];
+
+					cmp_result = DatumGetInt32(
+											   FunctionCall2Coll(cmp, collation,
+																 val, key->sk_argument));
+					switch (key->sk_strategy)
+					{
+						case BTLessStrategyNumber:
+							if (cmp_result >= 0)
+								CS_DESELECT_ROW(scan->sel_bitmap, row);
+							break;
+						case BTLessEqualStrategyNumber:
+							if (cmp_result > 0)
+								CS_DESELECT_ROW(scan->sel_bitmap, row);
+							break;
+						case BTEqualStrategyNumber:
+							if (cmp_result != 0)
+								CS_DESELECT_ROW(scan->sel_bitmap, row);
+							break;
+						case BTGreaterEqualStrategyNumber:
+							if (cmp_result < 0)
+								CS_DESELECT_ROW(scan->sel_bitmap, row);
+							break;
+						case BTGreaterStrategyNumber:
+							if (cmp_result <= 0)
+								CS_DESELECT_ROW(scan->sel_bitmap, row);
+							break;
+					}
+				}
+			}
+		}
+	}
+
+	/* Apply bloom filter predicates */
+	for (int f = 0; f < scan->bf_nfilters; f++)
+	{
+		int			bf_col = scan->bf_attnos[f] - 1;
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, bf_col);
+
+		cs_ensure_column_loaded(cache, rel, bf_col);
+
+		if (cache->col_dict && cache->col_dict[bf_col] != NULL)
+		{
+			CSDictColumn *dict = cache->col_dict[bf_col];
+
+			/* Build bloom dict match array once per row group */
+			if (scan->bf_dk_match_rg[f] != scan->cur_rowgroup)
+			{
+				if (scan->bf_dk_match[f])
+					pfree(scan->bf_dk_match[f]);
+
+				scan->bf_dk_match[f] = palloc0(sizeof(bool) * (dict->dict_count + 1));
+				for (int d = 0; d < dict->dict_count; d++)
+				{
+					if (!bloom_lacks_datum(scan->bf_filters[f],
+										   dict->dict_values[d], attr))
+						scan->bf_dk_match[f][d] = true;
+				}
+				scan->bf_dk_match_rg[f] = scan->cur_rowgroup;
+			}
+
+			cs_sel_bitmap_apply_dict(scan->sel_bitmap, dict,
+									 scan->bf_dk_match[f], nrows);
+		}
+		else
+		{
+			/* Non-dict column: per-row bloom filter check */
+			for (uint32 row = 0; row < nrows; row++)
+			{
+				Datum		val;
+				bool		isnull;
+
+				if (!CS_ISSELECTED(scan->sel_bitmap, row))
+					continue;
+
+				val = cs_cache_get_value(cache, tupdesc, bf_col, row, &isnull);
+				if (isnull || bloom_lacks_datum(scan->bf_filters[f], val, attr))
+					CS_DESELECT_ROW(scan->sel_bitmap, row);
+			}
+		}
+	}
+
+	scan->sel_bitmap_valid = true;
+}
+
+/*
+ * Check whether a row group can be skipped based on zone maps.
+ *
+ * Returns true if the row group can definitely be skipped (no matching
+ * rows possible), false if it might contain matching rows.
+ *
+ * Supports four zone map modes (CS_ZM_BYVAL, CS_ZM_EXACT, CS_ZM_PREFIX,
+ * CS_ZM_SORTKEY), IS NULL/NOT NULL pushdown, and SK_SEARCHARRAY evaluation.
+ */
+static bool
+cs_zonemap_skip_rowgroup(CScanDesc scan, CSRowGroupDesc *rg_desc)
+{
+	CSZoneMap  *zonemaps = CSRowGroupGetZoneMaps(rg_desc);
+
+	if (!scan->zm_cmp_initialized)
+		cs_zonemap_init_cmp_cache(scan);
+
+	for (int i = 0; i < scan->cs_nkeys; i++)
+	{
+		ScanKey		key = &scan->cs_keys[i];
+		AttrNumber	attno = key->sk_attno;
+		int			col;
+		CSZoneMap  *zm;
+		FmgrInfo   *cmp;
+		Oid			collation;
+		Datum		scanval;
+		Datum		zm_min;
+		Datum		zm_max;
+		int			cmp_min;
+		int			cmp_max;
+
+		if (attno < 1 || attno > rg_desc->rg_natts)
+			continue;
+
+		col = attno - 1;
+		zm = &zonemaps[col];
+
+		/*
+		 * IS NOT NULL: skip row group if all values are NULL (indicated by
+		 * zm_has_minmax being false, meaning no non-null values exist).
+		 *
+		 * IS NULL: skip row group if no nulls exist.  We know there are no
+		 * nulls when the column chunk has has_nulls=false.
+		 */
+		if (key->sk_flags & SK_SEARCHNOTNULL)
+		{
+			/*
+			 * Only an explicit all-NULL marking allows the skip; a missing
+			 * min/max can also mean the type has no btree opclass or the
+			 * bounds were not storable, with plenty of non-null rows.
+			 */
+			if (zm->zm_all_null)
+				return true;	/* no non-null rows in this group */
+			continue;
+		}
+		if (key->sk_flags & SK_SEARCHNULL)
+		{
+			if (zm->zm_has_minmax &&
+				!rg_desc->rg_columns[col].cc_has_nulls)
+				return true;	/* no NULLs in this row group */
+			continue;
+		}
+
+		if (!zm->zm_has_minmax)
+			continue;
+		if (key->sk_flags & SK_ISNULL)
+			continue;
+
+		/* Skip keys without a cached comparison function */
+		cmp = &scan->zm_cmp_finfo[i];
+		if (!OidIsValid(cmp->fn_oid))
+			continue;
+
+		collation = scan->zm_cmp_collation[i];
+		scanval = key->sk_argument;
+
+		/*
+		 * Sort key zone maps store raw collation sort key bytes, not varlena
+		 * values.  Compare by generating a sort key for the scan constant and
+		 * using memcmp.
+		 */
+		if (zm->zm_mode == CS_ZM_SORTKEY)
+		{
+			pg_locale_t locale;
+			char	   *str;
+			ssize_t		slen;
+			char		sk_buf[CS_ZONEMAP_INLINE_SIZE * 2];
+			size_t		sk_len;
+
+			if (key->sk_flags & SK_SEARCHARRAY)
+			{
+				bool		any_in_range = false;
+
+				if (!scan->sa_initialized)
+					cs_init_array_scan_keys(scan);
+
+				locale = pg_newlocale_from_collation(collation);
+
+				for (int e = 0; e < scan->sa_nelem[i]; e++)
+				{
+					int			cmp_lo,
+								cmp_hi,
+								minlen;
+
+					if (scan->sa_elem_nulls[i][e])
+						continue;
+
+					str = VARDATA_ANY(DatumGetPointer(scan->sa_elem_values[i][e]));
+					slen = VARSIZE_ANY_EXHDR(DatumGetPointer(scan->sa_elem_values[i][e]));
+
+					sk_len = pg_strnxfrm_prefix(sk_buf, sizeof(sk_buf),
+												str, slen, locale);
+
+					minlen = Min(sk_len, zm->zm_min_len);
+					cmp_lo = memcmp(sk_buf, zm->zm_min_data, minlen);
+					if (cmp_lo == 0)
+						cmp_lo = (sk_len < zm->zm_min_len) ? -1 :
+							(sk_len > zm->zm_min_len) ? 1 : 0;
+					if (cmp_lo < 0)
+						continue;
+
+					minlen = Min(sk_len, zm->zm_max_len);
+					cmp_hi = memcmp(sk_buf, zm->zm_max_data, minlen);
+					if (cmp_hi == 0)
+						cmp_hi = (sk_len < zm->zm_max_len) ? -1 :
+							(sk_len > zm->zm_max_len) ? 1 : 0;
+					if (cmp_hi > 0)
+						continue;
+
+					any_in_range = true;
+					break;
+				}
+
+				if (!any_in_range)
+					return true;
+
+				continue;
+			}
+
+			if (key->sk_flags & SK_ISNULL)
+				continue;
+
+			locale = pg_newlocale_from_collation(collation);
+			str = VARDATA_ANY(DatumGetPointer(scanval));
+			slen = VARSIZE_ANY_EXHDR(DatumGetPointer(scanval));
+
+			sk_len = pg_strnxfrm_prefix(sk_buf, sizeof(sk_buf),
+										str, slen, locale);
+
+			switch (key->sk_strategy)
+			{
+				case BTLessStrategyNumber:
+					{
+						int			minlen = Min(sk_len, zm->zm_min_len);
+
+						cmp_min = memcmp(zm->zm_min_data, sk_buf, minlen);
+						if (cmp_min == 0)
+							cmp_min = (zm->zm_min_len < sk_len) ? -1 :
+								(zm->zm_min_len > sk_len) ? 1 : 0;
+						if (cmp_min >= 0)
+							return true;
+						break;
+					}
+				case BTLessEqualStrategyNumber:
+					{
+						int			minlen = Min(sk_len, zm->zm_min_len);
+
+						cmp_min = memcmp(zm->zm_min_data, sk_buf, minlen);
+						if (cmp_min == 0)
+							cmp_min = (zm->zm_min_len < sk_len) ? -1 :
+								(zm->zm_min_len > sk_len) ? 1 : 0;
+						if (cmp_min > 0)
+							return true;
+						break;
+					}
+				case BTEqualStrategyNumber:
+					{
+						int			minlen;
+
+						minlen = Min(sk_len, zm->zm_min_len);
+						cmp_min = memcmp(sk_buf, zm->zm_min_data, minlen);
+						if (cmp_min == 0)
+							cmp_min = (sk_len < zm->zm_min_len) ? -1 :
+								(sk_len > zm->zm_min_len) ? 1 : 0;
+						if (cmp_min < 0)
+							return true;
+
+						minlen = Min(sk_len, zm->zm_max_len);
+						cmp_max = memcmp(sk_buf, zm->zm_max_data, minlen);
+						if (cmp_max == 0)
+							cmp_max = (sk_len < zm->zm_max_len) ? -1 :
+								(sk_len > zm->zm_max_len) ? 1 : 0;
+						if (cmp_max > 0)
+							return true;
+						break;
+					}
+				case BTGreaterEqualStrategyNumber:
+					{
+						int			minlen = Min(sk_len, zm->zm_max_len);
+
+						cmp_max = memcmp(zm->zm_max_data, sk_buf, minlen);
+						if (cmp_max == 0)
+							cmp_max = (zm->zm_max_len < sk_len) ? -1 :
+								(zm->zm_max_len > sk_len) ? 1 : 0;
+						if (cmp_max < 0)
+							return true;
+						break;
+					}
+				case BTGreaterStrategyNumber:
+					{
+						int			minlen = Min(sk_len, zm->zm_max_len);
+
+						cmp_max = memcmp(zm->zm_max_data, sk_buf, minlen);
+						if (cmp_max == 0)
+							cmp_max = (zm->zm_max_len < sk_len) ? -1 :
+								(zm->zm_max_len > sk_len) ? 1 : 0;
+						if (cmp_max <= 0)
+							return true;
+						break;
+					}
+				default:
+					break;
+			}
+
+			continue;
+		}
+
+		/*
+		 * Reconstruct Datum values.  For by-value types, zm_min/zm_max are
+		 * stored directly.  For by-reference types (CS_ZM_EXACT or
+		 * CS_ZM_PREFIX), point into the inline storage.
+		 */
+		if (zm->zm_mode == CS_ZM_EXACT || zm->zm_mode == CS_ZM_PREFIX)
+		{
+			zm_min = PointerGetDatum(zm->zm_min_data);
+			zm_max = PointerGetDatum(zm->zm_max_data);
+		}
+		else
+		{
+			zm_min = zm->zm_min;
+			zm_max = zm->zm_max;
+		}
+
+		/*
+		 * For SK_SEARCHARRAY (= ANY), skip the row group only if every array
+		 * element falls outside the [zm_min, zm_max] range.
+		 */
+		if (key->sk_flags & SK_SEARCHARRAY)
+		{
+			bool		any_in_range = false;
+
+			if (!scan->sa_initialized)
+				cs_init_array_scan_keys(scan);
+
+			for (int e = 0; e < scan->sa_nelem[i]; e++)
+			{
+				if (scan->sa_elem_nulls[i][e])
+					continue;
+
+				cmp_min = DatumGetInt32(
+										FunctionCall2Coll(cmp, collation,
+														  zm_min,
+														  scan->sa_elem_values[i][e]));
+				if (cmp_min > 0)
+					continue;
+				cmp_max = DatumGetInt32(
+										FunctionCall2Coll(cmp, collation,
+														  zm_max,
+														  scan->sa_elem_values[i][e]));
+				if (cmp_max < 0)
+					continue;
+
+				any_in_range = true;
+				break;
+			}
+
+			if (!any_in_range)
+				return true;
+
+			continue;
+		}
+
+		/*
+		 * Compare zone map bounds against the scan value using the type's
+		 * btree comparison function.
+		 */
+		switch (key->sk_strategy)
+		{
+			case BTLessStrategyNumber:
+				cmp_min = DatumGetInt32(FunctionCall2Coll(cmp, collation,
+														  zm_min, scanval));
+				if (cmp_min >= 0)
+					return true;
+				break;
+
+			case BTLessEqualStrategyNumber:
+				cmp_min = DatumGetInt32(FunctionCall2Coll(cmp, collation,
+														  zm_min, scanval));
+				if (cmp_min > 0)
+					return true;
+				break;
+
+			case BTEqualStrategyNumber:
+				cmp_min = DatumGetInt32(FunctionCall2Coll(cmp, collation,
+														  zm_min, scanval));
+				if (cmp_min > 0)
+					return true;
+				cmp_max = DatumGetInt32(FunctionCall2Coll(cmp, collation,
+														  zm_max, scanval));
+				if (cmp_max < 0)
+					return true;
+				break;
+
+			case BTGreaterEqualStrategyNumber:
+				cmp_max = DatumGetInt32(FunctionCall2Coll(cmp, collation,
+														  zm_max, scanval));
+				if (cmp_max < 0)
+					return true;
+				break;
+
+			case BTGreaterStrategyNumber:
+				cmp_max = DatumGetInt32(FunctionCall2Coll(cmp, collation,
+														  zm_max, scanval));
+				if (cmp_max <= 0)
+					return true;
+				break;
+
+			default:
+				break;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Push a bloom filter down to the scan for hash join probe filtering.
+ *
+ * Each call pushes one filter for one column.  Up to 8 filters can be
+ * active simultaneously.  Passing filter=NULL clears all filters.
+ */
+void
+cs_scan_set_bloom_filter(TableScanDesc sscan, AttrNumber attno,
+						 bloom_filter *filter)
+{
+	CScanDesc	scan = (CScanDesc) sscan;
+
+	/* NULL filter means clear all filters */
+	if (filter == NULL)
+	{
+		for (int i = 0; i < scan->bf_nfilters; i++)
+		{
+			if (scan->bf_dk_match && scan->bf_dk_match[i])
+			{
+				pfree(scan->bf_dk_match[i]);
+				scan->bf_dk_match[i] = NULL;
+			}
+		}
+		if (scan->bf_filters)
+			pfree(scan->bf_filters);
+		if (scan->bf_attnos)
+			pfree(scan->bf_attnos);
+		if (scan->bf_dk_match)
+			pfree(scan->bf_dk_match);
+		if (scan->bf_dk_match_rg)
+			pfree(scan->bf_dk_match_rg);
+		scan->bf_filters = NULL;
+		scan->bf_attnos = NULL;
+		scan->bf_dk_match = NULL;
+		scan->bf_dk_match_rg = NULL;
+		scan->bf_nfilters = 0;
+		return;
+	}
+
+	/* Allocate arrays on first push */
+	if (scan->bf_nfilters == 0)
+	{
+		scan->bf_filters = palloc(sizeof(bloom_filter *) * 8);
+		scan->bf_attnos = palloc(sizeof(AttrNumber) * 8);
+		scan->bf_dk_match = palloc0(sizeof(bool *) * 8);
+		scan->bf_dk_match_rg = palloc(sizeof(uint32) * 8);
+		for (int i = 0; i < 8; i++)
+			scan->bf_dk_match_rg[i] = UINT32_MAX;
+	}
+
+	/* Append the new filter (limit to 8) */
+	if (scan->bf_nfilters < 8)
+	{
+		int			idx = scan->bf_nfilters;
+
+		scan->bf_filters[idx] = filter;
+		scan->bf_attnos[idx] = attno;
+		scan->bf_nfilters++;
+	}
 }
 
 /*
@@ -2440,6 +4080,7 @@ static bool
 cs_columnar_getnext(CScanDesc scan, TupleTableSlot *slot)
 {
 	Relation	rel = scan->rs_base.rs_rd;
+	int			natts = RelationGetDescr(rel)->natts;
 	CSColumnCache *cache = &scan->colcache;
 
 	while (!scan->columnar_done)
@@ -2451,6 +4092,40 @@ cs_columnar_getnext(CScanDesc scan, TupleTableSlot *slot)
 
 			while (scan->cur_rowgroup < scan->nrowgroups)
 			{
+				/*
+				 * Read the catalog entry to check zone maps before loading
+				 * the full column data.
+				 */
+				if (scan->rg_catalog_blocks != NULL &&
+					scan->rg_catalog_blocks[scan->cur_rowgroup] != InvalidBlockNumber &&
+					scan->cs_nkeys > 0)
+				{
+					CSRowGroupDesc *rg_desc;
+					Size		rg_size = CSRowGroupDescSize(natts);
+
+					if (!cache->cur_rg_desc)
+						cache->cur_rg_desc = cs_cache_alloc(cache, rg_size);
+					rg_desc = cache->cur_rg_desc;
+
+					cs_read_rowgroup_catalog(rel,
+											 scan->rg_catalog_blocks[scan->cur_rowgroup],
+											 rg_desc, natts);
+
+					scan->instr_rg_examined++;
+					if (cs_zonemap_skip_rowgroup(scan, rg_desc))
+					{
+						scan->instr_rg_zonemap_skipped++;
+						scan->cur_rowgroup++;
+						continue;
+					}
+
+					/*
+					 * Catalog already loaded; skip re-read in
+					 * cs_load_rowgroup
+					 */
+					scan->rg_desc_preloaded = true;
+				}
+
 				if (cs_load_rowgroup(scan, rel, scan->cur_rowgroup))
 				{
 					scan->cur_row_in_group = 0;
@@ -2481,6 +4156,17 @@ cs_columnar_getnext(CScanDesc scan, TupleTableSlot *slot)
 				memset(slot->tts_isnull, true, total * sizeof(bool));
 				memset(slot->tts_values, 0, total * sizeof(Datum));
 			}
+
+			/*
+			 * Late materialization: pre-load only the columns referenced by
+			 * scan keys so that row-level filtering can evaluate them without
+			 * decompressing the remaining columns.
+			 */
+			if (scan->cs_nkeys > 0 || scan->bf_nfilters > 0)
+			{
+				cs_preload_qual_columns(scan, cache, rel);
+				cs_build_selection_bitmap(scan, cache, rel);
+			}
 		}
 
 		/* Return the current row from the loaded row group */
@@ -2493,10 +4179,26 @@ cs_columnar_getnext(CScanDesc scan, TupleTableSlot *slot)
 
 			scan->cur_row_in_group++;
 
-			/* Check deletion bitmap */
-			if (cache->cur_delbitmap != NULL)
+			if (scan->sel_bitmap_valid)
 			{
-				if (CS_ISDELETED(cache->cur_delbitmap, row))
+				/*
+				 * Selection bitmap incorporates deletion bitmap and all
+				 * pushed-down predicates.
+				 */
+				if (!CS_ISSELECTED(scan->sel_bitmap, row))
+					continue;
+			}
+			else
+			{
+				/* No selection bitmap: check deletion bitmap and quals */
+				if (cache->cur_delbitmap != NULL)
+				{
+					if (CS_ISDELETED(cache->cur_delbitmap, row))
+						continue;
+				}
+
+				if ((scan->cs_nkeys > 0 || scan->bf_nfilters > 0) &&
+					!cs_row_passes_scan_keys(scan, cache, row))
 					continue;
 			}
 

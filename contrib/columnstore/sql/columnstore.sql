@@ -93,6 +93,63 @@ SELECT count(*) AS multi_rg_count FROM cs_basic;
 SELECT a, b FROM cs_basic WHERE a = 1;
 SELECT a, b FROM cs_basic WHERE a = 200;
 
+-- Zone map filtering (row group 1: a=1..100, row group 2: a=200..250)
+-- All btree strategies: <, <=, =, >=, >
+SELECT count(*) AS zm_lt FROM cs_basic WHERE a < 50;
+SELECT count(*) AS zm_le FROM cs_basic WHERE a <= 100;
+SELECT count(*) AS zm_eq FROM cs_basic WHERE a = 200;
+SELECT count(*) AS zm_ge FROM cs_basic WHERE a >= 200;
+SELECT count(*) AS zm_gt FROM cs_basic WHERE a > 250;
+-- Combined filter
+SELECT count(*) AS zm_range FROM cs_basic WHERE a >= 50 AND a <= 100;
+SELECT count(*) AS zone_all FROM cs_basic;
+
+-- Zone maps with different by-value types
+CREATE TABLE cs_zm_types (
+    i int, f float4, d date, b bool
+) USING columnstore;
+INSERT INTO cs_zm_types
+    SELECT i, i::float4, '2020-01-01'::date + i, (i % 2 = 0)
+    FROM generate_series(1, 100) i;
+VACUUM cs_zm_types;
+INSERT INTO cs_zm_types
+    SELECT i, i::float4, '2020-01-01'::date + i, (i % 2 = 0)
+    FROM generate_series(200, 300) i;
+VACUUM cs_zm_types;
+-- These should benefit from zone map pruning
+SELECT count(*) AS zm_int FROM cs_zm_types WHERE i > 150;
+SELECT count(*) AS zm_float FROM cs_zm_types WHERE f < 50.0::float4;
+SELECT count(*) AS zm_date FROM cs_zm_types WHERE d > '2020-07-20'::date;
+
+-- NULLs in zone maps
+CREATE TABLE cs_zm_nulls (a int, b int) USING columnstore;
+INSERT INTO cs_zm_nulls SELECT i, CASE WHEN i <= 50 THEN NULL ELSE i END
+    FROM generate_series(1, 100) i;
+VACUUM cs_zm_nulls;
+-- b has NULLs but zone map should still track non-NULL range (51..100)
+SELECT count(*) AS zm_null_eq FROM cs_zm_nulls WHERE b = 75;
+SELECT count(*) AS zm_null_gt FROM cs_zm_nulls WHERE b > 100;
+DROP TABLE cs_zm_types;
+DROP TABLE cs_zm_nulls;
+
+-- Zone maps on by-reference types (text, numeric)
+CREATE TABLE cs_zm_text (id int, name text, amount numeric) USING columnstore;
+INSERT INTO cs_zm_text SELECT i, 'aaa-' || i, i * 1.5
+    FROM generate_series(1, 100) i;
+VACUUM cs_zm_text;
+INSERT INTO cs_zm_text SELECT i, 'zzz-' || i, i * 1.5
+    FROM generate_series(101, 200) i;
+VACUUM cs_zm_text;
+-- Text zone map: should skip RG2
+SELECT count(*) AS zm_text_eq FROM cs_zm_text WHERE name = 'aaa-50';
+-- Text zone map: should skip RG1
+SELECT count(*) AS zm_text_gt FROM cs_zm_text WHERE name > 'yyy';
+-- Numeric zone map: should skip RG2
+SELECT count(*) AS zm_num_lt FROM cs_zm_text WHERE amount < 10;
+-- Numeric zone map: should skip RG1
+SELECT count(*) AS zm_num_gt FROM cs_zm_text WHERE amount > 200;
+DROP TABLE cs_zm_text;
+
 -- Compression: highly-compressible data round-trips correctly
 DROP TABLE cs_basic;
 CREATE TABLE cs_basic (a int, b text) USING columnstore;

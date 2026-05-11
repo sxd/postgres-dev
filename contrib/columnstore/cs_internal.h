@@ -835,6 +835,10 @@ extern void cs_scan_rescan(TableScanDesc scan, ScanKeyData *key,
 						   bool allow_sync, bool allow_pagemode);
 extern void cs_scan_set_projection(TableScanDesc scan,
 								   Bitmapset *needed_cols);
+extern void cs_scan_set_qual_keys(TableScanDesc scan, int nkeys,
+								  ScanKeyData *keys);
+extern void cs_scan_set_bloom_filter(TableScanDesc scan, AttrNumber attno,
+									 struct bloom_filter *filter);
 extern bool cs_scan_column_encoding(TableScanDesc scan, AttrNumber attno,
 									Oid *phys_type, int32 *dscale);
 extern bool cs_scan_get_raw_attr(TableScanDesc scan, TupleTableSlot *slot,

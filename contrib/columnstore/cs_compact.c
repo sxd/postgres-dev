@@ -2904,25 +2904,60 @@ cs_write_one_rowgroup(Relation rel, TupleDesc tupdesc, int natts,
 
 					if (found_nonnull)
 					{
-						if (byref)
+						if (byref && attr->attlen > 0)
 						{
 							/*
-							 * By-reference type: store inline if the
-							 * detoasted values fit within the inline storage.
-							 * The Datum pointers reference col_values which
-							 * will be freed, so we must copy the data into
-							 * the zone map.
+							 * Fixed-length by-reference type (uuid, interval,
+							 * ...): the value is attlen raw bytes, not a
+							 * varlena, so VARSIZE_ANY would misread its first
+							 * bytes as a length header.  Store the raw bytes
+							 * inline; the comparison side hands the type's
+							 * comparator a plain pointer, as for any by-ref
+							 * bound.
+							 */
+							if (attr->attlen <= CS_ZONEMAP_INLINE_SIZE)
+							{
+								memcpy(zonemaps[col].zm_min_data,
+									   DatumGetPointer(minval), attr->attlen);
+								memcpy(zonemaps[col].zm_max_data,
+									   DatumGetPointer(maxval), attr->attlen);
+								zonemaps[col].zm_min_len = attr->attlen;
+								zonemaps[col].zm_max_len = attr->attlen;
+								zonemaps[col].zm_mode = CS_ZM_EXACT;
+								zonemaps[col].zm_has_minmax = true;
+							}
+							/* else: oversized fixed type, no zone map */
+						}
+						else if (byref && attr->attlen == -1)
+						{
+							/*
+							 * Varlena type: store inline if the detoasted
+							 * values fit within the inline storage.  The
+							 * Datum pointers reference col_values which will
+							 * be freed, so we must copy the data into the
+							 * zone map.
 							 *
 							 * For values exceeding the inline size, build
-							 * truncated prefix bounds when the collation uses
-							 * byte-wise ordering (C or no collation).  The
-							 * min prefix is a simple truncation (always <=
-							 * original); the max prefix is truncated and then
+							 * truncated prefix bounds when the type's btree
+							 * order is the byte order of its representation
+							 * (text-family types under a byte-ordered
+							 * collation, and bytea).  Other varlenas --
+							 * numeric's digit array, arrays, ranges -- have
+							 * no such property, and a truncated value is not
+							 * even structurally valid, so they get no zone
+							 * map beyond the exact-fit case.  The min prefix
+							 * is a simple truncation (always <= original);
+							 * the max prefix is truncated and then
 							 * incremented to produce an upper bound (always
 							 * >= original).
 							 */
 							Size		min_size = VARSIZE_ANY(DatumGetPointer(minval));
 							Size		max_size = VARSIZE_ANY(DatumGetPointer(maxval));
+							bool		byte_ordered_type =
+								(attr->atttypid == TEXTOID ||
+								 attr->atttypid == VARCHAROID ||
+								 attr->atttypid == BPCHAROID ||
+								 attr->atttypid == BYTEAOID);
 
 							if (min_size <= CS_ZONEMAP_INLINE_SIZE &&
 								max_size <= CS_ZONEMAP_INLINE_SIZE)
@@ -2936,9 +2971,10 @@ cs_write_one_rowgroup(Relation rel, TupleDesc tupdesc, int natts,
 								zonemaps[col].zm_mode = CS_ZM_EXACT;
 								zonemaps[col].zm_has_minmax = true;
 							}
-							else if (collation == InvalidOid ||
-									 collation == C_COLLATION_OID ||
-									 pg_newlocale_from_collation(collation)->collate_is_c)
+							else if (byte_ordered_type &&
+									 (collation == InvalidOid ||
+									  collation == C_COLLATION_OID ||
+									  pg_newlocale_from_collation(collation)->collate_is_c))
 							{
 								/*
 								 * Build truncated prefix bounds. The min
@@ -3022,15 +3058,16 @@ cs_write_one_rowgroup(Relation rel, TupleDesc tupdesc, int natts,
 								}
 								/* else: all payload bytes 0xFF, skip */
 							}
-							else
+							else if (byte_ordered_type)
 							{
 								/*
-								 * Non-C collation with values exceeding
-								 * inline size.  If the collation supports
-								 * sort key prefix generation (ICU), store
-								 * truncated sort key prefixes.  Sort keys
-								 * have the byte-order = sort-order property,
-								 * so memcmp comparison is valid.
+								 * Text-family value under a non-C collation
+								 * exceeding the inline size.  If the
+								 * collation supports sort key prefix
+								 * generation (ICU), store truncated sort key
+								 * prefixes.  Sort keys have the byte-order =
+								 * sort-order property, so memcmp comparison
+								 * is valid.
 								 */
 								pg_locale_t locale;
 

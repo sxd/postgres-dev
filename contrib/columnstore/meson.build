@@ -41,6 +41,9 @@ tests += {
       'cs_delta_columnar',
       'cs_dictionary',
       'cs_encoding',
+      'cs_pushdown',
+      'cs_scan_paths',
+      'cs_zonemap',
     ],
   },
   'isolation': {
