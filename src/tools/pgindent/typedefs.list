@@ -316,6 +316,7 @@ BlocksReadStreamData
 BlocktableEntry
 BloomBuildState
 BloomFilter
+BloomFilterState
 BloomMetaPageData
 BloomOpaque
 BloomOptions
@@ -3112,7 +3113,6 @@ TParserStateActionItem
 TQueueDestReceiver
 TRGM
 TSAnyCacheEntry
-TscClockSourceInfo
 TSConfigCacheEntry
 TSConfigInfo
 TSDictInfo
@@ -3263,6 +3263,7 @@ TriggerInfo
 TriggerInstrumentation
 TriggerTransition
 TruncateStmt
+TscClockSourceInfo
 TsmRoutine
 TupOutputState
 TupSortStatus
