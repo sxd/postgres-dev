@@ -1125,6 +1125,17 @@ typedef struct HashJoin
 	 * Zero when this HashJoin has no consumers.
 	 */
 	int			bloom_filter_id;
+
+	/*
+	 * Whether to also build one bloom filter per join key (in addition to the
+	 * combined-hash filter), so that a recipient can test an individual key
+	 * column on its own -- e.g. a column store probing a per-column
+	 * dictionary or zone map.  Set at plan time only when the recipient is a
+	 * CustomScan that advertised CUSTOMPATH_SUPPORT_BLOOM_FILTERS.  The
+	 * combined filter is always built and remains the more selective one;
+	 * per-key filters are an opt-in extra that nobody else pays for.
+	 */
+	bool		bloom_perkey;
 } HashJoin;
 
 /* ----------------

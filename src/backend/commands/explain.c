@@ -3621,16 +3621,29 @@ show_hash_info(HashState *hashstate, ExplainState *es)
 		{
 			ExplainIndentText(es);
 			if (hashstate->bloom_filter != NULL)
+			{
 				appendStringInfo(es->str,
 								 "Bloom Filter %d: bits=" UINT64_FORMAT
 								 " hashes=%d memory=" UINT64_FORMAT "kB"
-								 " checked=" UINT64_FORMAT " rejected=" UINT64_FORMAT "\n",
+								 " checked=" UINT64_FORMAT " rejected=" UINT64_FORMAT,
 								 producer_id,
 								 nbits,
 								 nhashfns,
 								 BYTES_TO_KILOBYTES(bytes),
 								 hashstate->bloomFilterChecked,
 								 hashstate->bloomFilterRejected);
+
+				/*
+				 * Per-key filters are sized like the combined one; account
+				 * for them rather than hiding a x(nkeys+1) memory factor.
+				 */
+				if (hashstate->perkey_filters != NULL &&
+					hashstate->perkey_nfilters > 0)
+					appendStringInfo(es->str, " perkey=%d memory=" UINT64_FORMAT "kB",
+									 hashstate->perkey_nfilters,
+									 BYTES_TO_KILOBYTES(bytes * hashstate->perkey_nfilters));
+				appendStringInfoChar(es->str, '\n');
+			}
 			else if (es->analyze)
 				appendStringInfo(es->str,
 								 "Bloom Filter %d: (not initialized)\n",

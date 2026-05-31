@@ -5002,6 +5002,18 @@ try_push_bloom_filter(PlannerInfo *root, HashJoin *hj, Plan *outer_plan)
 	recipient->bloom_filters = lappend(recipient->bloom_filters, bf);
 
 	/*
+	 * If the recipient is a CustomScan that opted in, also build a separate
+	 * filter per join key.  Only such a recipient can make use of them (to
+	 * test a single column against a dictionary or zone map); the combined
+	 * filter is always built and is the more selective one for the per-row
+	 * probe.  There is nothing to gain for a single-key join, where the two
+	 * coincide.
+	 */
+	if (list_length(hashkeys) > 1 && IsA(recipient, CustomScan) &&
+		(((CustomScan *) recipient)->flags & CUSTOMPATH_SUPPORT_BLOOM_FILTERS))
+		hj->bloom_perkey = true;
+
+	/*
 	 * XXX We've manged to push the filter to the scan node, but maybe we
 	 * should wait with updating bloom_consumer_count when it actually
 	 * initializes the filters in ExecInit()?
