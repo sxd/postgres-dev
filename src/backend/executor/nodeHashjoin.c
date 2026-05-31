@@ -317,6 +317,18 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 					 */
 					node->hj_FirstOuterTupleSlot = NULL;
 				}
+				else if (((HashJoin *) node->js.ps.plan)->bloom_eager)
+				{
+					/*
+					 * We pushed a bloom filter to a CustomScan on the outer
+					 * side that wants it at scan start (e.g. to skip row
+					 * groups before decompression).  Skip the empty-outer
+					 * prefetch and build the hash table -- and the filter --
+					 * first, so it is ready before the outer scan produces
+					 * its first tuple.
+					 */
+					node->hj_FirstOuterTupleSlot = NULL;
+				}
 				else if (HJ_FILL_OUTER(node) ||
 						 (outerNode->plan->startup_cost < hashNode->ps.plan->total_cost &&
 						  !node->hj_OuterNotEmpty))

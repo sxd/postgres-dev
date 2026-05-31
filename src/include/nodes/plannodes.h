@@ -1136,6 +1136,16 @@ typedef struct HashJoin
 	 * per-key filters are an opt-in extra that nobody else pays for.
 	 */
 	bool		bloom_perkey;
+
+	/*
+	 * Whether to build the hash table (and bloom filter) before fetching the
+	 * first outer tuple, skipping the empty-outer prefetch optimization.  Set
+	 * at plan time when the filter is pushed to a CustomScan recipient, which
+	 * may want to apply the filter the moment its scan starts (e.g. a column
+	 * store skipping row groups before decompression) rather than after
+	 * having already produced a batch unfiltered.  See ExecHashJoinImpl.
+	 */
+	bool		bloom_eager;
 } HashJoin;
 
 /* ----------------
