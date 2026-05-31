@@ -4799,6 +4799,34 @@ find_bloom_filter_recipient(Plan *plan, Index target_relid)
 					return plan;
 				return NULL;
 			}
+		case T_CustomScan:
+			{
+				/*
+				 * A CustomScan on a base relation can act as a recipient, but
+				 * only if the provider advertised that it knows how to
+				 * consume a pushed-down bloom filter.  Unlike the stock
+				 * scans, the probe is not performed by ExecScanExtended() (a
+				 * CustomScan dispatches to the provider's own
+				 * ExecCustomScan); the provider is responsible for calling
+				 * ExecBloomFilters() at whatever granularity it likes.
+				 * Non-leaf custom nodes have scanrelid == 0 and so are
+				 * rejected by the relid test.
+				 */
+				CustomScan *cscan = (CustomScan *) plan;
+
+				/*
+				 * Refuse a recipient that emits a custom_scan_tlist:
+				 * setrefs.c fixes pushed filter_exprs like scan quals
+				 * (physical varnos) and has no INDEX_VAR rewrite for the
+				 * tlist-bearing case, so the expressions would be left
+				 * unfixed.
+				 */
+				if ((cscan->flags & CUSTOMPATH_SUPPORT_BLOOM_FILTERS) &&
+					cscan->scan.scanrelid == target_relid &&
+					cscan->custom_scan_tlist == NIL)
+					return plan;
+				return NULL;
+			}
 		case T_Sort:
 		case T_IncrementalSort:
 		case T_Material:

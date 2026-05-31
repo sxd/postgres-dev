@@ -2263,6 +2263,14 @@ ExecBloomFilters(List *filters, ExprContext *econtext)
 		Assert(producer != NULL);
 
 		/*
+		 * Defend production builds anyway: with no producer there is no
+		 * filter to probe, and "no filter" must mean "everything passes",
+		 * never a dereference of NULL.
+		 */
+		if (producer == NULL)
+			continue;
+
+		/*
 		 * The hashtable (and the bloom filter) is built lazily the first time
 		 * it needs to do a lookup. Until then, assume everything matches
 		 * everything through. Once the filter is in place, start probing it.
