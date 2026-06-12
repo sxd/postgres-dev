@@ -4765,6 +4765,19 @@ bloom_join_side_preserved(JoinType jointype, bool to_outer)
  * later). We support pushing filters through intermediate nodes (joins,
  * sorts, ...). See bloom_join_side_preserved for joins.
  *
+ * filter_stable says whether the filter's contents are guaranteed not to
+ * change across rescans of the producing join.  When the join's inner side
+ * can be rebuilt with different rows (it is parameterized, or this is a
+ * subquery that may re-execute with new parameter values), the filter is
+ * rebuilt too -- but a Sort, Material, or Memoize between the recipient and
+ * the join merely rewinds (or keeps cache entries) when its own parameters
+ * are unchanged, replaying rows that were pruned by the previous filter.
+ * Rows that the new filter would pass are then missing from the join input.
+ * So we may only descend through such rescan-buffering nodes when
+ * filter_stable is true.  Nodes that always re-execute their child on
+ * rescan (Unique, IncrementalSort) are safe to descend through regardless,
+ * as the refreshed scan probes the current filter.
+ *
  * XXX We could push filters through more nodes - e.g. aggregates if the
  * hash keys match GROUP BY keys (are a subset of).
  *
@@ -4773,7 +4786,7 @@ bloom_join_side_preserved(JoinType jointype, bool to_outer)
  * won't have access to the hashjoin state).
  */
 static Plan *
-find_bloom_filter_recipient(Plan *plan, Index target_relid)
+find_bloom_filter_recipient(Plan *plan, Index target_relid, bool filter_stable)
 {
 	/* XXX shouldn't really happen, I think */
 	if (plan == NULL)
@@ -4828,12 +4841,26 @@ find_bloom_filter_recipient(Plan *plan, Index target_relid)
 				return NULL;
 			}
 		case T_Sort:
-		case T_IncrementalSort:
 		case T_Material:
 		case T_Memoize:
+
+			/*
+			 * These nodes replay buffered output on a rescan when their own
+			 * parameters are unchanged (Sort and Material rewind, Memoize
+			 * keeps cache entries), so a filter that can be rebuilt with
+			 * different contents must not sit below them; see the function
+			 * comment.  Note that a Limit must never be descended through at
+			 * all: pruning rows below it would change which rows it passes.
+			 */
+			if (!filter_stable)
+				return NULL;
+			return find_bloom_filter_recipient(outerPlan(plan), target_relid,
+											   filter_stable);
+		case T_IncrementalSort:
 		case T_Unique:
-		case T_Limit:
-			return find_bloom_filter_recipient(outerPlan(plan), target_relid);
+			/* these always re-execute their child on rescan; safe */
+			return find_bloom_filter_recipient(outerPlan(plan), target_relid,
+											   filter_stable);
 		case T_HashJoin:
 		case T_NestLoop:
 		case T_MergeJoin:
@@ -4850,14 +4877,16 @@ find_bloom_filter_recipient(Plan *plan, Index target_relid)
 				if (bloom_join_side_preserved(jt, true))
 				{
 					res = find_bloom_filter_recipient(outerPlan(plan),
-													  target_relid);
+													  target_relid,
+													  filter_stable);
 					if (res != NULL)
 						return res;
 				}
 				if (bloom_join_side_preserved(jt, false))
 				{
 					res = find_bloom_filter_recipient(innerPlan(plan),
-													  target_relid);
+													  target_relid,
+													  filter_stable);
 					if (res != NULL)
 						return res;
 				}
@@ -4896,7 +4925,8 @@ find_bloom_filter_recipient(Plan *plan, Index target_relid)
  * not great, as it'd add overhead for everyone.
  */
 static void
-try_push_bloom_filter(PlannerInfo *root, HashJoin *hj, Plan *outer_plan)
+try_push_bloom_filter(PlannerInfo *root, HashJoin *hj, Plan *outer_plan,
+					  bool inner_parameterized)
 {
 	List	   *hashkeys = hj->hashkeys;
 	List	   *hashops = hj->hashoperators;
@@ -4905,9 +4935,19 @@ try_push_bloom_filter(PlannerInfo *root, HashJoin *hj, Plan *outer_plan)
 	Index		target_relid = 0;
 	Plan	   *recipient;
 	BloomFilter *bf;
+	bool		filter_stable;
 
 	/* bail out if feature disabled. */
 	if (!enable_hashjoin_bloom)
+		return;
+
+	/*
+	 * No pushdown from a parallel-aware hash: only the serial hash build
+	 * (MultiExecPrivateHash) populates the bloom filter, so a filter pushed
+	 * from a Parallel Hash would stay permanently empty and reject every
+	 * probe.  (ExecHashTableCreate asserts this cannot be reached.)
+	 */
+	if (innerPlan(hj)->parallel_aware)
 		return;
 
 	/* XXX shouldn't really happen, I think */
@@ -4974,11 +5014,24 @@ try_push_bloom_filter(PlannerInfo *root, HashJoin *hj, Plan *outer_plan)
 	Assert(target_relid != 0);
 
 	/*
+	 * Decide whether the filter contents are stable across rescans of this
+	 * join, which determines whether the recipient search may descend through
+	 * rescan-buffering nodes (see find_bloom_filter_recipient). The contents
+	 * change whenever the inner side is rebuilt with different rows: when the
+	 * inner path is parameterized, or when this is a subquery, which may be
+	 * re-executed with new outer-query parameter values that only the inner
+	 * side depends on.  (The plan's extParam sets, which would let us decide
+	 * this exactly, are not computed until after plan creation.)
+	 */
+	filter_stable = !inner_parameterized && root->query_level == 1;
+
+	/*
 	 * See if we can find the scan node for target_relid. It certainly is in
 	 * the plan somewhere, but it may not be able to pushdown the filter to it
 	 * (because of a join or so).
 	 */
-	recipient = find_bloom_filter_recipient(outer_plan, target_relid);
+	recipient = find_bloom_filter_recipient(outer_plan, target_relid,
+											filter_stable);
 	if (recipient == NULL)
 		return;
 
@@ -5210,7 +5263,8 @@ create_hashjoin_plan(PlannerInfo *root,
 	 * outer subtree. If a suitable scan node exists, add the filter to
 	 * bloom_filters, and bump our bloom_consumer_count.
 	 */
-	try_push_bloom_filter(root, join_plan, outer_plan);
+	try_push_bloom_filter(root, join_plan, outer_plan,
+						  best_path->jpath.innerjoinpath->param_info != NULL);
 
 	return join_plan;
 }
