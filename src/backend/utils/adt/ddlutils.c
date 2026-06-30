@@ -20,12 +20,14 @@
 
 #include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "access/table.h"
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
+#include "catalog/pg_publication_rel.h"
 #include "catalog/pg_tablespace.h"
 #include "commands/tablespace.h"
 #include "common/relpath.h"
@@ -33,7 +35,6 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/acl.h"
-#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datetime.h"
 #include "utils/fmgroids.h"
@@ -46,35 +47,6 @@
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 
-/* Option value types for DDL option parsing */
-typedef enum
-{
-	DDL_OPT_BOOL,
-	DDL_OPT_TEXT,
-	DDL_OPT_INT,
-} DdlOptType;
-
-/*
- * A single DDL option descriptor: caller fills in name and type,
- * parse_ddl_options fills in isset + the appropriate value field.
- */
-typedef struct DdlOption
-{
-	const char *name;			/* option name (case-insensitive match) */
-	DdlOptType	type;			/* expected value type */
-	bool		isset;			/* true if caller supplied this option */
-	/* fields for specific option types */
-	union
-	{
-		bool		boolval;	/* filled in for DDL_OPT_BOOL */
-		char	   *textval;	/* filled in for DDL_OPT_TEXT (palloc'd) */
-		int			intval;		/* filled in for DDL_OPT_INT */
-	};
-} DdlOption;
-
-
-static void parse_ddl_options(FunctionCallInfo fcinfo, int variadic_start,
-							  DdlOption *opts, int nopts);
 static void append_ddl_option(StringInfo buf, bool pretty, int indent,
 							  const char *fmt, ...)
 			pg_attribute_printf(4, 5);
@@ -83,149 +55,13 @@ static void append_guc_value(StringInfo buf, const char *name,
 static List *pg_get_role_ddl_internal(Oid roleid, bool pretty,
 									  bool memberships);
 static List *pg_get_tablespace_ddl_internal(Oid tsid, bool pretty, bool no_owner);
-static Datum pg_get_tablespace_ddl_srf(FunctionCallInfo fcinfo, Oid tsid, bool isnull);
+static Datum pg_get_tablespace_ddl_srf(FunctionCallInfo fcinfo, Oid tsid);
 static List *pg_get_database_ddl_internal(Oid dbid, bool pretty,
 										  bool no_owner, bool no_tablespace);
-
-
-/*
- * parse_ddl_options
- * 		Parse variadic name/value option pairs
- *
- * Options are passed as alternating key/value text pairs.  The caller
- * provides an array of DdlOption descriptors specifying the accepted
- * option names and their types; this function matches each supplied
- * pair against the array, validates the value, and fills in the
- * result fields.
- */
-static void
-parse_ddl_options(FunctionCallInfo fcinfo, int variadic_start,
-				  DdlOption *opts, int nopts)
-{
-	Datum	   *args;
-	bool	   *nulls;
-	Oid		   *types;
-	int			nargs;
-
-	/* Clear all output fields */
-	for (int i = 0; i < nopts; i++)
-	{
-		opts[i].isset = false;
-		switch (opts[i].type)
-		{
-			case DDL_OPT_BOOL:
-				opts[i].boolval = false;
-				break;
-			case DDL_OPT_TEXT:
-				opts[i].textval = NULL;
-				break;
-			case DDL_OPT_INT:
-				opts[i].intval = 0;
-				break;
-		}
-	}
-
-	nargs = extract_variadic_args(fcinfo, variadic_start, true,
-								  &args, &types, &nulls);
-
-	if (nargs <= 0)
-		return;
-
-	/* Handle DEFAULT NULL case */
-	if (nargs == 1 && nulls[0])
-		return;
-
-	if (nargs % 2 != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("variadic arguments must be name/value pairs"),
-				 errhint("Provide an even number of variadic arguments that can be divided into pairs.")));
-
-	/*
-	 * For each option name/value pair, find corresponding positional option
-	 * for the option name, and assign the option value.
-	 */
-	for (int i = 0; i < nargs; i += 2)
-	{
-		char	   *name;
-		char	   *valstr;
-		DdlOption  *opt = NULL;
-
-		if (nulls[i])
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("option name at variadic position %d is null", i + 1)));
-
-		name = TextDatumGetCString(args[i]);
-
-		if (nulls[i + 1])
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("value for option \"%s\" must not be null", name)));
-
-		/* Find matching option descriptor */
-		for (int j = 0; j < nopts; j++)
-		{
-			if (pg_strcasecmp(name, opts[j].name) == 0)
-			{
-				opt = &opts[j];
-				break;
-			}
-		}
-
-		if (opt == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("unrecognized option: \"%s\"", name)));
-
-		if (opt->isset)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("option \"%s\" is specified more than once",
-							name)));
-
-		valstr = TextDatumGetCString(args[i + 1]);
-
-		switch (opt->type)
-		{
-			case DDL_OPT_BOOL:
-				if (!parse_bool(valstr, &opt->boolval))
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("invalid value for boolean option \"%s\": %s",
-									name, valstr)));
-				break;
-
-			case DDL_OPT_TEXT:
-				opt->textval = valstr;
-				valstr = NULL;	/* don't pfree below */
-				break;
-
-			case DDL_OPT_INT:
-				{
-					char	   *endp;
-					long		val;
-
-					errno = 0;
-					val = strtol(valstr, &endp, 10);
-					if (*endp != '\0' || errno == ERANGE ||
-						val < PG_INT32_MIN || val > PG_INT32_MAX)
-						ereport(ERROR,
-								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-								 errmsg("invalid value for integer option \"%s\": %s",
-										name, valstr)));
-					opt->intval = (int) val;
-				}
-				break;
-		}
-
-		opt->isset = true;
-
-		if (valstr)
-			pfree(valstr);
-		pfree(name);
-	}
-}
+static Datum pg_get_publication_ddl_srf(FunctionCallInfo fcinfo,
+										Oid puboid, bool isnull);
+static List *pg_get_publication_ddl_internal(Oid puboid, bool pretty,
+											 bool no_owner);
 
 /*
  * Helper to append a formatted string with optional pretty-printing.
@@ -590,7 +426,6 @@ pg_get_role_ddl_internal(Oid roleid, bool pretty, bool memberships)
  * Each row is a complete SQL statement.  The first row is always the
  * CREATE ROLE statement; subsequent rows are ALTER ROLE SET statements
  * and optionally GRANT statements for role memberships.
- * Returns no rows if the role argument is NULL.
  */
 Datum
 pg_get_role_ddl(PG_FUNCTION_ARGS)
@@ -602,26 +437,17 @@ pg_get_role_ddl(PG_FUNCTION_ARGS)
 	{
 		MemoryContext oldcontext;
 		Oid			roleid;
-		DdlOption	opts[] = {
-			{"pretty", DDL_OPT_BOOL},
-			{"memberships", DDL_OPT_BOOL},
-		};
+		bool		pretty;
+		bool		memberships;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		if (PG_ARGISNULL(0))
-		{
-			MemoryContextSwitchTo(oldcontext);
-			SRF_RETURN_DONE(funcctx);
-		}
-
 		roleid = PG_GETARG_OID(0);
-		parse_ddl_options(fcinfo, 1, opts, lengthof(opts));
+		pretty = PG_GETARG_BOOL(1);
+		memberships = PG_GETARG_BOOL(2);
 
-		statements = pg_get_role_ddl_internal(roleid,
-											  opts[0].isset && opts[0].boolval,
-											  !opts[1].isset || opts[1].boolval);
+		statements = pg_get_role_ddl_internal(roleid, pretty, memberships);
 		funcctx->user_fctx = statements;
 		funcctx->max_calls = list_length(statements);
 
@@ -755,7 +581,7 @@ pg_get_tablespace_ddl_internal(Oid tsid, bool pretty, bool no_owner)
  * pg_get_tablespace_ddl_srf - common SRF logic for tablespace DDL
  */
 static Datum
-pg_get_tablespace_ddl_srf(FunctionCallInfo fcinfo, Oid tsid, bool isnull)
+pg_get_tablespace_ddl_srf(FunctionCallInfo fcinfo, Oid tsid)
 {
 	FuncCallContext *funcctx;
 	List	   *statements;
@@ -763,25 +589,16 @@ pg_get_tablespace_ddl_srf(FunctionCallInfo fcinfo, Oid tsid, bool isnull)
 	if (SRF_IS_FIRSTCALL())
 	{
 		MemoryContext oldcontext;
-		DdlOption	opts[] = {
-			{"pretty", DDL_OPT_BOOL},
-			{"owner", DDL_OPT_BOOL},
-		};
+		bool		pretty;
+		bool		no_owner;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		if (isnull)
-		{
-			MemoryContextSwitchTo(oldcontext);
-			SRF_RETURN_DONE(funcctx);
-		}
+		pretty = PG_GETARG_BOOL(1);
+		no_owner = !PG_GETARG_BOOL(2);
 
-		parse_ddl_options(fcinfo, 1, opts, lengthof(opts));
-
-		statements = pg_get_tablespace_ddl_internal(tsid,
-													opts[0].isset && opts[0].boolval,
-													opts[1].isset && !opts[1].boolval);
+		statements = pg_get_tablespace_ddl_internal(tsid, pretty, no_owner);
 		funcctx->user_fctx = statements;
 		funcctx->max_calls = list_length(statements);
 
@@ -813,14 +630,9 @@ pg_get_tablespace_ddl_srf(FunctionCallInfo fcinfo, Oid tsid, bool isnull)
 Datum
 pg_get_tablespace_ddl_oid(PG_FUNCTION_ARGS)
 {
-	Oid			tsid = InvalidOid;
-	bool		isnull;
+	Oid			tsid = PG_GETARG_OID(0);
 
-	isnull = PG_ARGISNULL(0);
-	if (!isnull)
-		tsid = PG_GETARG_OID(0);
-
-	return pg_get_tablespace_ddl_srf(fcinfo, tsid, isnull);
+	return pg_get_tablespace_ddl_srf(fcinfo, tsid);
 }
 
 /*
@@ -830,19 +642,10 @@ pg_get_tablespace_ddl_oid(PG_FUNCTION_ARGS)
 Datum
 pg_get_tablespace_ddl_name(PG_FUNCTION_ARGS)
 {
-	Oid			tsid = InvalidOid;
-	Name		tspname;
-	bool		isnull;
+	Name		tspname = PG_GETARG_NAME(0);
+	Oid			tsid = get_tablespace_oid(NameStr(*tspname), false);
 
-	isnull = PG_ARGISNULL(0);
-
-	if (!isnull)
-	{
-		tspname = PG_GETARG_NAME(0);
-		tsid = get_tablespace_oid(NameStr(*tspname), false);
-	}
-
-	return pg_get_tablespace_ddl_srf(fcinfo, tsid, isnull);
+	return pg_get_tablespace_ddl_srf(fcinfo, tsid);
 }
 
 /*
@@ -1140,28 +943,20 @@ pg_get_database_ddl(PG_FUNCTION_ARGS)
 	{
 		MemoryContext oldcontext;
 		Oid			dbid;
-		DdlOption	opts[] = {
-			{"pretty", DDL_OPT_BOOL},
-			{"owner", DDL_OPT_BOOL},
-			{"tablespace", DDL_OPT_BOOL},
-		};
+		bool		pretty;
+		bool		no_owner;
+		bool		no_tablespace;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		if (PG_ARGISNULL(0))
-		{
-			MemoryContextSwitchTo(oldcontext);
-			SRF_RETURN_DONE(funcctx);
-		}
-
 		dbid = PG_GETARG_OID(0);
-		parse_ddl_options(fcinfo, 1, opts, lengthof(opts));
+		pretty = PG_GETARG_BOOL(1);
+		no_owner = !PG_GETARG_BOOL(2);
+		no_tablespace = !PG_GETARG_BOOL(3);
 
-		statements = pg_get_database_ddl_internal(dbid,
-												  opts[0].isset && opts[0].boolval,
-												  opts[1].isset && !opts[1].boolval,
-												  opts[2].isset && !opts[2].boolval);
+		statements = pg_get_database_ddl_internal(dbid, pretty, no_owner,
+												  no_tablespace);
 		funcctx->user_fctx = statements;
 		funcctx->max_calls = list_length(statements);
 
@@ -1184,4 +979,378 @@ pg_get_database_ddl(PG_FUNCTION_ARGS)
 		list_free_deep(statements);
 		SRF_RETURN_DONE(funcctx);
 	}
+}
+
+/*
+ * pg_get_publication_ddl_srf - common SRF logic for publication DDL
+ */
+static Datum
+pg_get_publication_ddl_srf(FunctionCallInfo fcinfo, Oid puboid, bool isnull)
+{
+	FuncCallContext *funcctx;
+	List	   *statements;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldcontext;
+		DdlOption	opts[] = {
+			{"pretty", DDL_OPT_BOOL},
+			{"owner", DDL_OPT_BOOL},
+		};
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (isnull)
+		{
+			MemoryContextSwitchTo(oldcontext);
+			SRF_RETURN_DONE(funcctx);
+		}
+
+		parse_ddl_options(fcinfo, 1, opts, lengthof(opts));
+
+		statements = pg_get_publication_ddl_internal(puboid,
+													 opts[0].isset && opts[0].boolval,
+													 opts[1].isset && !opts[1].boolval);
+
+		funcctx->user_fctx = statements;
+		funcctx->max_calls = list_length(statements);
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	statements = (List *) funcctx->user_fctx;
+
+	if (funcctx->call_cntr < funcctx->max_calls)
+	{
+		char	   *stmt;
+
+		stmt = (char *) list_nth(statements, funcctx->call_cntr);
+
+		SRF_RETURN_NEXT(funcctx, CStringGetTextDatum(stmt));
+	}
+	else
+	{
+		list_free_deep(statements);
+		SRF_RETURN_DONE(funcctx);
+	}
+}
+
+/*
+ * pg_get_publication_ddl_oid
+ *		Return DDL to recreate a publication, taking OID.
+ */
+Datum
+pg_get_publication_ddl_oid(PG_FUNCTION_ARGS)
+{
+	Oid			puboid = InvalidOid;
+	bool		isnull;
+
+	isnull = PG_ARGISNULL(0);
+	if (!isnull)
+		puboid = PG_GETARG_OID(0);
+
+	return pg_get_publication_ddl_srf(fcinfo, puboid, isnull);
+}
+
+/*
+ * pg_get_publication_ddl_name
+ *		Return DDL to recreate a publication, taking name.
+ */
+Datum
+pg_get_publication_ddl_name(PG_FUNCTION_ARGS)
+{
+	Oid			puboid = InvalidOid;
+	bool		isnull;
+
+	isnull = PG_ARGISNULL(0);
+	if (!isnull)
+	{
+		char	   *pubname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+		puboid = get_publication_oid(pubname, false);
+		pfree(pubname);
+	}
+
+	return pg_get_publication_ddl_srf(fcinfo, puboid, isnull);
+}
+
+/*
+ * pg_get_publication_ddl_internal
+ *		Common code for pg_get_publication_ddl_oid and
+ *		pg_get_publication_ddl_name.
+ *
+ * Returns a List of palloc'd strings.  The first element is the
+ * CREATE PUBLICATION statement; if no_owner is false a second element
+ * carries an ALTER PUBLICATION ... OWNER TO statement (the CREATE
+ * PUBLICATION grammar has no OWNER clause, so ownership must be applied
+ * as a follow-on statement).
+ */
+static List *
+pg_get_publication_ddl_internal(Oid puboid, bool pretty, bool no_owner)
+{
+	Publication *pub;
+	StringInfoData buf;
+	List	   *statements = NIL;
+	List	   *pub_incl_relids = NIL;
+	List	   *pub_excl_relids = NIL;
+	List	   *pub_schemas = NIL;
+	bool		first_perm = true;
+
+	if (!SearchSysCacheExists1(PUBLICATIONOID, ObjectIdGetDatum(puboid)))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("publication with OID %u does not exist", puboid)));
+
+	pub = GetPublication(puboid);
+
+	initStringInfo(&buf);
+
+	appendStringInfo(&buf, "CREATE PUBLICATION %s", quote_identifier(pub->name));
+
+	/*
+	 * Having all tables or all sequences means that there are no per-table
+	 * publications
+	 */
+	if (pub->alltables || pub->allsequences)
+	{
+		append_ddl_option(&buf, pretty, 4, "FOR ");
+
+		if (pub->alltables)
+		{
+			appendStringInfoString(&buf, "ALL TABLES");
+			pub_excl_relids = GetExcludedPublicationTables(
+														   pub->oid, PUBLICATION_PART_ROOT);
+
+			if (pub_excl_relids != NIL)
+			{
+				ListCell   *excl_cell;
+				char	   *schemaname = NULL;
+
+				appendStringInfoString(&buf, " EXCEPT (TABLE ");
+
+				foreach(excl_cell, pub_excl_relids)
+				{
+					HeapTuple	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(excl_cell->oid_value));
+					Form_pg_class reltup;
+
+					if (!HeapTupleIsValid(tp))
+						elog(ERROR, "cache lookup failed for relation %u", excl_cell->oid_value);
+
+					reltup = (Form_pg_class) GETSTRUCT(tp);
+					schemaname = get_namespace_name(reltup->relnamespace);
+
+					appendStringInfo(&buf, "%s%s",
+									 foreach_current_index(excl_cell) > 0 ? ", " : "",
+									 quote_qualified_identifier(schemaname, NameStr(reltup->relname)));
+
+					pfree(schemaname);
+					ReleaseSysCache(tp);
+				}
+
+				appendStringInfoChar(&buf, ')');
+			}
+		}
+		if (pub->allsequences)
+			appendStringInfo(&buf,
+							 "%sALL SEQUENCES",
+							 pub->alltables ? ", " : "");
+	}
+	else
+	{
+		pub_incl_relids = GetIncludedPublicationRelations(pub->oid, PUBLICATION_PART_ROOT);
+		pub_schemas = GetPublicationSchemas(pub->oid);
+	}
+
+	/*
+	 * Publication can have table relations
+	 */
+	if (pub_incl_relids != NIL)
+	{
+		ListCell   *pub_cell;
+		char	   *schemaname = NULL;
+		char	   *tablename;
+
+		append_ddl_option(&buf, pretty, 4, "FOR TABLE ");
+
+		foreach(pub_cell, pub_incl_relids)
+		{
+			HeapTuple	pubtuple = NULL;
+			HeapTuple	reltup;
+			Form_pg_class relform;
+			Datum		columns,
+						rowfilter;
+			Oid			relid = pub_cell->oid_value;
+			bool		cols_nulls,
+						condition_nulls;
+
+			reltup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+			if (!HeapTupleIsValid(reltup))
+				elog(ERROR,
+					 "cache lookup failed for relation %u",
+					 relid);
+
+			relform = (Form_pg_class) GETSTRUCT(reltup);
+			tablename = NameStr(relform->relname);
+			schemaname = get_namespace_name(relform->relnamespace);
+
+			appendStringInfo(&buf, "%s%s",
+							 foreach_current_index(pub_cell) > 0 ? ", " : "",
+							 quote_qualified_identifier(schemaname, tablename));
+
+			pfree(schemaname);
+
+			pubtuple = SearchSysCache2(PUBLICATIONRELMAP, ObjectIdGetDatum(relid),
+									   ObjectIdGetDatum(pub->oid));
+
+			if (!HeapTupleIsValid(pubtuple))
+				elog(ERROR,
+					 "cache lookup failed for relation %u in publication %u",
+					 relid, pub->oid);
+
+			columns = SysCacheGetAttr(PUBLICATIONRELMAP, pubtuple,
+									  Anum_pg_publication_rel_prattrs,
+									  &cols_nulls);
+
+			rowfilter = SysCacheGetAttr(PUBLICATIONRELMAP, pubtuple,
+										Anum_pg_publication_rel_prqual,
+										&condition_nulls);
+
+			/* If non-null, we have a list of columns to publish */
+			if (!cols_nulls)
+			{
+				Bitmapset  *attmap;
+				int			attnum = -1;
+
+				attmap = pub_collist_to_bitmapset(NULL, columns, NULL);
+
+				appendStringInfoChar(&buf, '(');
+				while ((attnum = bms_next_member(attmap, attnum)) >= 0)
+				{
+					appendStringInfo(&buf, "%s%s",
+									 bms_member_index(attmap, attnum) ? ", " : "",
+									 quote_identifier(get_attname(relid, attnum, false)));
+				}
+				appendStringInfoChar(&buf, ')');
+
+				bms_free(attmap);
+			}
+
+			/*
+			 * If there is a condition it goes after the columns. We can have
+			 * conditions without columns as well.
+			 */
+			if (!condition_nulls)
+			{
+				Node	   *node;
+				List	   *context;
+				char	   *str;
+
+				node = stringToNode(TextDatumGetCString(rowfilter));
+				context = deparse_context_for(tablename, relid);
+				str = deparse_expression(node, context, false, false);
+				appendStringInfo(&buf, " WHERE (%s)", str);
+			}
+
+			ReleaseSysCache(pubtuple);
+			ReleaseSysCache(reltup);
+		}
+	}
+
+	/* If we have schemas, they will go right before the EXCEPT and/or WITH */
+	if (pub_schemas != NIL)
+	{
+		ListCell   *schema_cell;
+
+		/*
+		 * Schemas can be preceded by a list of tables.  When they are, the
+		 * "TABLES IN SCHEMA" stays inline as a continuation of the existing
+		 * FOR clause; otherwise it starts the FOR clause on its own line in
+		 * pretty mode.
+		 */
+		if (pub_incl_relids == NIL)
+			append_ddl_option(&buf, pretty, 4, "FOR TABLES IN SCHEMA");
+		else
+			appendStringInfoString(&buf, ", TABLES IN SCHEMA");
+
+		foreach(schema_cell, pub_schemas)
+		{
+			char	   *nspname = get_namespace_name(schema_cell->oid_value);
+
+			appendStringInfo(&buf, "%s %s",
+							 foreach_current_index(schema_cell) > 0 ? "," : "",
+							 quote_identifier(nspname));
+			pfree(nspname);
+		}
+	}
+
+	/* Always add the WITH options */
+	append_ddl_option(&buf, pretty, 4, "WITH (");
+
+	/* Publish string */
+	appendStringInfoString(&buf, "publish='");
+
+
+	if (pub->pubactions.pubinsert)
+	{
+		/*
+		 * By precedence we know that the insert will always be first, no need
+		 * to check previous values
+		 */
+		appendStringInfoString(&buf, "insert");
+		first_perm = false;
+	}
+	if (pub->pubactions.pubupdate)
+	{
+		appendStringInfo(&buf, "%supdate", first_perm ? "" : ", ");
+		first_perm = false;
+	}
+	if (pub->pubactions.pubdelete)
+	{
+		appendStringInfo(&buf, "%sdelete", first_perm ? "" : ", ");
+		first_perm = false;
+	}
+	if (pub->pubactions.pubtruncate)
+	{
+		appendStringInfo(&buf, "%struncate", first_perm ? "" : ", ");
+	}
+
+	appendStringInfoString(&buf, "', ");
+
+	/* publish_generated_columns string */
+	appendStringInfo(&buf, "publish_generated_columns=%s, ",
+					 pub->pubgencols_type == PUBLISH_GENCOLS_NONE ? "none" : "stored");
+
+	/* publish_via_partition_root value */
+	appendStringInfo(&buf, "publish_via_partition_root=%s)",
+					 pub->pubviaroot ? "true" : "false");
+
+	appendStringInfoChar(&buf, ';');
+	statements = lappend(statements, pstrdup(buf.data));
+	pfree(buf.data);
+
+	/* OWNER */
+	if (!no_owner)
+	{
+		HeapTuple	tup;
+		Form_pg_publication pubform;
+		char	   *owner;
+
+		tup = SearchSysCache1(PUBLICATIONOID, ObjectIdGetDatum(puboid));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for publication %u", puboid);
+		pubform = (Form_pg_publication) GETSTRUCT(tup);
+		owner = GetUserNameFromId(pubform->pubowner, false);
+		ReleaseSysCache(tup);
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf, "ALTER PUBLICATION %s OWNER TO %s;",
+						 quote_identifier(pub->name), quote_identifier(owner));
+		statements = lappend(statements, pstrdup(buf.data));
+		pfree(buf.data);
+		pfree(owner);
+	}
+
+	return statements;
 }
